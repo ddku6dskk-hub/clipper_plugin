@@ -68,8 +68,8 @@ set(KYOHEI_COMMON_LIBS
 
 # ===== Kyohei Clipper (マスタリング向け, 16x OS + lookahead) =====
 juce_add_plugin(KyoheiClipper
-    COMPANY_NAME "KyoheiAudio"
-    BUNDLE_ID com.kyohei.clipper
+    COMPANY_NAME "K Audio"
+    BUNDLE_ID com.kaudio.clipper
     PLUGIN_MANUFACTURER_CODE Khyk
     PLUGIN_CODE Kcl1
     FORMATS ${KYOHEI_FORMATS}
@@ -93,8 +93,8 @@ target_link_libraries(KyoheiClipper PRIVATE ${KYOHEI_COMMON_LIBS})
 
 # ===== Kyohei Slammer (ドラム/ベース向け, 4x OS, lookahead なし) =====
 juce_add_plugin(KyoheiSlammer
-    COMPANY_NAME "KyoheiAudio"
-    BUNDLE_ID com.kyohei.slammer
+    COMPANY_NAME "K Audio"
+    BUNDLE_ID com.kaudio.slammer
     PLUGIN_MANUFACTURER_CODE Khyk
     PLUGIN_CODE Ksl1
     FORMATS ${KYOHEI_FORMATS}

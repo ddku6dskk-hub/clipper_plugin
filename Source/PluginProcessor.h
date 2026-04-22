@@ -21,9 +21,9 @@ public:
     const juce::String getName() const override
     {
 #if KYOHEI_SLAMMER
-        return "Kyohei Slammer";
+        return "K Slammer";
 #else
-        return "Kyohei Clipper";
+        return "K Clipper";
 #endif
     }
     bool acceptsMidi() const override { return false; }
