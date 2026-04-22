@@ -1,0 +1,14 @@
+build/
+legal/
+verification/
+.DS_Store
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.log
+xcuserdata/
