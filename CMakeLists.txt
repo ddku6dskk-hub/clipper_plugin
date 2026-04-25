@@ -30,8 +30,7 @@ if(NOT DEFINED AAX_SDK_PATH)
     file(GLOB _aax_candidates "$ENV{HOME}/SDKs/AAX_SDK_*"
                               "$ENV{HOME}/SDKs/AAX-SDK-*"
                               "$ENV{HOME}/Developer/AAX_SDK_*")
-    list(SORT _aax_candidates)
-    list(REVERSE _aax_candidates) # 最新版を先頭に
+    list(SORT _aax_candidates COMPARE NATURAL ORDER DESCENDING) # 最新版を先頭に (10.0 > 9.0)
     foreach(_p IN LISTS _aax_candidates)
         if(IS_DIRECTORY "${_p}")
             set(AAX_SDK_PATH "${_p}")
