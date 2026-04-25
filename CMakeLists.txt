@@ -4,6 +4,7 @@ project(KyoheiClipper VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "minimum macOS version")
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "build universal binary (Apple Silicon + Intel)")
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../JUCE JUCE)
 
