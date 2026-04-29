@@ -32,6 +32,12 @@ private:
     float grSmoothed = 0.0f;   // 表示用に 1次LP smoothed value
     float grPeakHold = 0.0f;   // ピークホールド値
     int   peakHoldFramesLeft = 0;
+
+    // 入力サンプルピーク状態 (dBFS、Timer から更新)
+    float inputPeakSmoothed     = -100.0f;
+    float inputPeakHold         = -100.0f;
+    int   inputPeakHoldFramesLeft = 0;
+
     juce::Rectangle<int> grMeterBounds;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KyoheiClipperEditor)

@@ -148,6 +148,9 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     for (int c = 0; c < numChannels; ++c)
         peakIn = juce::jmax (peakIn, buffer.getMagnitude (c, 0, numSamples));
 
+    // 入力サンプルピーク (dBFS) を UI に渡す
+    inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
+
     // oversample up
     juce::dsp::AudioBlock<float> block (buffer);
     auto osBlock = oversampler->processSamplesUp (block);

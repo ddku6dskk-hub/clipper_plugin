@@ -94,16 +94,13 @@ void KyoheiClipperEditor::resized()
 
 void KyoheiClipperEditor::timerCallback()
 {
-    const float raw = proc.grPeakDb.load (std::memory_order_relaxed);
-
-    // attack 即時、release は緩く下降
-    grSmoothed = juce::jmax (raw, grSmoothed * 0.82f);
-
-    // peak hold (1 秒)
-    if (raw >= grPeakHold)
+    // GR (Gain Reduction)
+    const float rawGr = proc.grPeakDb.load (std::memory_order_relaxed);
+    grSmoothed = juce::jmax (rawGr, grSmoothed * 0.82f);
+    if (rawGr >= grPeakHold)
     {
-        grPeakHold = raw;
-        peakHoldFramesLeft = 30;
+        grPeakHold = rawGr;
+        peakHoldFramesLeft = 30; // 1 秒 (30Hz)
     }
     else if (peakHoldFramesLeft > 0)
     {
@@ -114,7 +111,25 @@ void KyoheiClipperEditor::timerCallback()
         grPeakHold = juce::jmax (grPeakHold - 0.25f, grSmoothed);
     }
 
-    repaint (grMeterBounds.expanded (0, 24)); // 数値表示分も含めて再描画
+    // 入力サンプルピーク (dBFS): attack 即時、release 緩やか、ピークホールド 1秒
+    const float rawIn = proc.inputPeakDb.load (std::memory_order_relaxed);
+    inputPeakSmoothed = juce::jmax (rawIn, inputPeakSmoothed - 1.5f);
+    if (rawIn >= inputPeakHold)
+    {
+        inputPeakHold = rawIn;
+        inputPeakHoldFramesLeft = 30;
+    }
+    else if (inputPeakHoldFramesLeft > 0)
+    {
+        --inputPeakHoldFramesLeft;
+    }
+    else
+    {
+        inputPeakHold = juce::jmax (inputPeakHold - 0.5f, inputPeakSmoothed);
+    }
+
+    // 数値テキストはバウンスより左右に広いので、横方向にも repaint 範囲を広げる (文字残像対策)
+    repaint (grMeterBounds.expanded (24, 24));
 }
 
 void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> bounds)
@@ -164,11 +179,12 @@ void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> b
         g.drawHorizontalLine (y, (float) bounds.getX(), (float) bounds.getRight());
     }
 
-    // 数値表示 (バー下: 現在 / ピーク dB)
-    auto textArea = juce::Rectangle<int> (bounds.getX() - 10, bounds.getBottom() + 2,
-                                          bounds.getWidth() + 20, 20);
+    // 数値表示 (バー下: 入力ピーク dBFS / GRピーク dB)
+    auto textArea = juce::Rectangle<int> (bounds.getX() - 24, bounds.getBottom() + 2,
+                                          bounds.getWidth() + 48, 20);
     g.setColour (juce::Colours::white);
     g.setFont (juce::Font (juce::FontOptions (11.0f)));
-    g.drawText (juce::String (grSmoothed, 1) + " / " + juce::String (grPeakHold, 1) + " dB",
-                textArea, juce::Justification::centred);
+    const juce::String inText = juce::String (inputPeakHold, 1) + " dBFS";
+    const juce::String grText = juce::String (grPeakHold,    1) + " dB";
+    g.drawText (inText + "  /  " + grText, textArea, juce::Justification::centred);
 }

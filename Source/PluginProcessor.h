@@ -47,6 +47,9 @@ public:
     // UI 側で Timer から読み取って描画する
     std::atomic<float> grPeakDb { 0.0f };
 
+    // 入力サンプルピーク [dBFS] — input gain 適用後 (= ユーザーが設定した Input ノブ反映済み)
+    std::atomic<float> inputPeakDb { -100.0f };
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
