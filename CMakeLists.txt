@@ -9,6 +9,16 @@ project(KyoheiClipper VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Strip absolute build-machine paths from binaries so __FILE__ literals
+# (e.g. inside AAX SDK assertion macros) don't leak the developer's home dir.
+# Applies to JUCE / AAX SDK / our sources alike.
+add_compile_options(
+    -ffile-prefix-map=$ENV{HOME}=~
+    -fmacro-prefix-map=$ENV{HOME}=~
+    -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.
+    -fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.
+)
+
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../JUCE JUCE)
 
 # ============================================================
