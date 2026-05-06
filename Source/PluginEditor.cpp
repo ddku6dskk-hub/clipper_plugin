@@ -81,10 +81,13 @@ void KyoheiClipperEditor::resized()
     placeCell (inputLabel,     inputGainSlider);
     placeCell (outputLabel,    outputGainSlider);
 
-    // GR メーター: ラベル + 縦バー (paint で描画)
+    // GR メーター: ラベル + CLIP LED 行 + 縦バー (paint で描画)
+    // GR ラベル下に CLIP LED 行 18px を確保 → bar はその分縮める
+    constexpr int clipRowH = 18;
     auto grCell = row.removeFromLeft (cellW);
     grLabel.setBounds (grCell.removeFromTop (labelH));
-    grMeterBounds = grCell.withSizeKeepingCentre (50, sliderH);
+    grCell.removeFromTop (clipRowH);
+    grMeterBounds = grCell.withSizeKeepingCentre (50, sliderH - clipRowH);
 
     area.removeFromTop (10);
     modeLabel.setBounds (area.removeFromTop (labelH));
@@ -96,10 +99,11 @@ void KyoheiClipperEditor::timerCallback()
 {
     // GR (Gain Reduction)
     const float rawGr = proc.grPeakDb.load (std::memory_order_relaxed);
-    grSmoothed = juce::jmax (rawGr, grSmoothed * 0.82f);
-    if (rawGr >= grPeakHold)
+    const float safeRawGr = (std::isfinite (rawGr) && rawGr >= 0.0f) ? rawGr : 0.0f;
+    grSmoothed = juce::jmax (safeRawGr, grSmoothed * 0.82f);
+    if (safeRawGr >= grPeakHold)
     {
-        grPeakHold = rawGr;
+        grPeakHold = safeRawGr;
         peakHoldFramesLeft = 30; // 1 秒 (30Hz)
     }
     else if (peakHoldFramesLeft > 0)
@@ -113,10 +117,12 @@ void KyoheiClipperEditor::timerCallback()
 
     // 入力サンプルピーク (dBFS): attack 即時、release 緩やか、ピークホールド 1秒
     const float rawIn = proc.inputPeakDb.load (std::memory_order_relaxed);
-    inputPeakSmoothed = juce::jmax (rawIn, inputPeakSmoothed - 1.5f);
-    if (rawIn >= inputPeakHold)
+    const float safeRawIn = std::isfinite (rawIn) ? juce::jlimit (-100.0f, 0.0f, rawIn) : -100.0f;
+    inputPeakSmoothed = juce::jlimit (-100.0f, 0.0f,
+                                      juce::jmax (safeRawIn, inputPeakSmoothed - 1.5f));
+    if (safeRawIn >= inputPeakHold)
     {
-        inputPeakHold = rawIn;
+        inputPeakHold = safeRawIn;
         inputPeakHoldFramesLeft = 30;
     }
     else if (inputPeakHoldFramesLeft > 0)
@@ -125,11 +131,25 @@ void KyoheiClipperEditor::timerCallback()
     }
     else
     {
-        inputPeakHold = juce::jmax (inputPeakHold - 0.5f, inputPeakSmoothed);
+        inputPeakHold = juce::jlimit (-100.0f, 0.0f,
+                                      juce::jmax (inputPeakHold - 0.5f, inputPeakSmoothed));
     }
 
-    // 数値テキストはバウンスより左右に広いので、横方向にも repaint 範囲を広げる (文字残像対策)
-    repaint (grMeterBounds.expanded (24, 24));
+    // クリップ LED: 出力 peak が 0 dBFS を超えたら点灯、30 frame (= 1秒) ホールド
+    float rawOut = proc.outputPeakDb.load (std::memory_order_relaxed);
+    if (! std::isfinite (rawOut))
+        rawOut = -100.0f;
+    if (rawOut > 0.0f)
+        clipLedFramesLeft = 30;
+    else if (clipLedFramesLeft > 0)
+        --clipLedFramesLeft;
+
+    // repaint 範囲: 横は数値テキスト (130px) 用に拡張、上は CLIP LED 用に広め
+    const int meterCx = grMeterBounds.getCentreX();
+    repaint (meterCx - 70,
+             grMeterBounds.getY() - 28,
+             140,
+             grMeterBounds.getHeight() + 52);
 }
 
 void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> bounds)
@@ -180,11 +200,59 @@ void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> b
     }
 
     // 数値表示 (バー下: 入力ピーク dBFS / GRピーク dB)
-    auto textArea = juce::Rectangle<int> (bounds.getX() - 24, bounds.getBottom() + 2,
-                                          bounds.getWidth() + 48, 20);
-    g.setColour (juce::Colours::white);
-    g.setFont (juce::Font (juce::FontOptions (11.0f)));
-    const juce::String inText = juce::String (inputPeakHold, 1) + " dBFS";
-    const juce::String grText = juce::String (grPeakHold,    1) + " dB";
-    g.drawText (inText + "  /  " + grText, textArea, juce::Justification::centred);
+    // input が 0 dBFS に達した瞬間以降 (1秒ピークホールド期間中) は dBFS 値を赤く描画
+    // text area: cell 幅 (130px) いっぱいに広げて折り返しを防ぐ
+    auto textArea = juce::Rectangle<int> (bounds.getCentreX() - 65, bounds.getBottom() + 2,
+                                          130, 20);
+    const float textInputPeak = juce::jlimit (-100.0f, 0.0f, inputPeakHold);
+    const float textGrPeak = juce::jlimit (0.0f, 99.9f, grPeakHold);
+    const juce::String inText = juce::String (textInputPeak, 1) + " dBFS";
+    const juce::String grText = juce::String (textGrPeak,    1) + " dB";
+    const juce::String separator { "  /  " };
+
+    const bool inputClip = (inputPeakHold >= -0.01f); // ほぼ 0dBFS or 上回った
+    const juce::Colour inColour = inputClip
+        ? juce::Colour::fromRGB (255, 90, 80)
+        : juce::Colours::white;
+
+    juce::AttributedString att;
+    juce::Font textFont (juce::FontOptions (10.0f));
+    att.append (inText,                textFont, inColour);
+    att.append (separator + grText,    textFont, juce::Colours::white);
+    att.setJustification (juce::Justification::centred);
+    att.setWordWrap (juce::AttributedString::none);  // 折返し禁止
+    att.draw (g, textArea.toFloat());
+
+    // クリップ LED (HA 風): バー上部に小さな赤 LED + "CLIP" ラベル横並び
+    constexpr int ledDiameter = 8;
+    const int rowY = bounds.getY() - 14;             // バー上 14px の余白
+    const int rowH = ledDiameter + 4;
+    const bool clipActive = clipLedFramesLeft > 0;
+
+    // LED 円 (左寄せ)
+    const int ledX = bounds.getX() + 6;
+    auto ledBounds = juce::Rectangle<float> ((float) ledX, (float) rowY,
+                                              (float) ledDiameter, (float) ledDiameter);
+    if (clipActive)
+    {
+        g.setColour (juce::Colour::fromRGB (255, 60, 50));
+        g.fillEllipse (ledBounds);
+        g.setColour (juce::Colour::fromRGB (255, 200, 180));
+        g.drawEllipse (ledBounds, 1.0f);
+    }
+    else
+    {
+        g.setColour (juce::Colour::fromRGB (60, 20, 22));
+        g.fillEllipse (ledBounds);
+        g.setColour (juce::Colour::fromRGB (40, 40, 48));
+        g.drawEllipse (ledBounds, 1.0f);
+    }
+
+    // "CLIP" ラベル (LED の右隣)
+    g.setColour (clipActive ? juce::Colour::fromRGB (255, 90, 80)
+                            : juce::Colour::fromRGB (90, 90, 100));
+    g.setFont (juce::Font (juce::FontOptions (9.0f, juce::Font::bold)));
+    auto labelArea = juce::Rectangle<int> (ledX + ledDiameter + 4, rowY - 1,
+                                            bounds.getWidth(), rowH);
+    g.drawText ("CLIP", labelArea, juce::Justification::centredLeft);
 }

@@ -38,6 +38,9 @@ private:
     float inputPeakHold         = -100.0f;
     int   inputPeakHoldFramesLeft = 0;
 
+    // クリップ LED 状態: 出力 peak が 0 dBFS を超えた瞬間に点灯、1秒ホールド
+    int   clipLedFramesLeft     = 0;
+
     juce::Rectangle<int> grMeterBounds;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KyoheiClipperEditor)

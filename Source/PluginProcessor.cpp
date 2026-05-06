@@ -2,6 +2,11 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+namespace
+{
+    constexpr float meterFloor = 1.0e-4f;
+}
+
 KyoheiClipperProcessor::KyoheiClipperProcessor()
     : juce::AudioProcessor (BusesProperties()
         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -87,7 +92,8 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
 #if KYOHEI_SLAMMER
     // Slammer: lookahead 段は使わない → OS 群遅延のみ
-    setLatencySamples (juce::roundToInt (oversampler->getLatencyInSamples()));
+    const int reportedLatency = juce::roundToInt (oversampler->getLatencyInSamples());
+    setLatencySamples (reportedLatency);
 #else
     // look-ahead limiter: 0.2 ms 相当（OS レート基準）
     // スイープ実測 (推し活_M4 Open 6dB): 0.2ms が音圧最大スイートスポット (LUFS -7.24)
@@ -103,8 +109,23 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     // 総レイテンシ: OS 群遅延 + limiter look-ahead (OS→base 換算)
     const double limiterBaseLatency = (double) lookaheadSamplesOS / std::pow (2.0, osFactor);
-    setLatencySamples (juce::roundToInt (oversampler->getLatencyInSamples() + limiterBaseLatency));
+    const int reportedLatency = juce::roundToInt (oversampler->getLatencyInSamples() + limiterBaseLatency);
+    setLatencySamples (reportedLatency);
 #endif
+
+    juce::dsp::ProcessSpec meterSpec;
+    meterSpec.sampleRate = sampleRate;
+    meterSpec.maximumBlockSize = (juce::uint32) samplesPerBlock;
+    meterSpec.numChannels = 2;
+
+    grMeterDelayLine.setMaximumDelayInSamples (juce::jmax (1, reportedLatency + 1));
+    grMeterDelayLine.prepare (meterSpec);
+    grMeterDelayLine.setDelay ((float) reportedLatency);
+    grMeterDelayLine.reset();
+
+    grPeakDb.store    (0.0f,    std::memory_order_relaxed);
+    inputPeakDb.store (-100.0f, std::memory_order_relaxed);
+    outputPeakDb.store (-100.0f, std::memory_order_relaxed);
 }
 
 bool KyoheiClipperProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -143,13 +164,33 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     // input gain
     buffer.applyGain (inGainLin);
 
-    // GR 計測用: クリップ前 peak (input gain 適用後)
+    // 入力サンプルピーク (dBFS) は現在ブロックの値を UI に渡す。
     float peakIn = 0.0f;
     for (int c = 0; c < numChannels; ++c)
         peakIn = juce::jmax (peakIn, buffer.getMagnitude (c, 0, numSamples));
 
-    // 入力サンプルピーク (dBFS) を UI に渡す
+    if (! std::isfinite (peakIn))
+        peakIn = 0.0f;
+
     inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
+
+    // GR 用 input peak は reported latency と同じ DelayLine で出力 peak と時間整合させる。
+    float peakInForGr = 0.0f;
+    for (int c = 0; c < numChannels; ++c)
+    {
+        const auto* src = buffer.getReadPointer (c);
+        const int delayChannel = juce::jmin (c, 1);
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            grMeterDelayLine.pushSample (delayChannel, src[i]);
+            const float delayed = grMeterDelayLine.popSample (delayChannel);
+            peakInForGr = juce::jmax (peakInForGr, std::abs (delayed));
+        }
+    }
+
+    if (! std::isfinite (peakInForGr))
+        peakInForGr = 0.0f;
 
     // oversample up
     juce::dsp::AudioBlock<float> block (buffer);
@@ -182,16 +223,68 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     for (int c = 0; c < numChannels; ++c)
         peakOut = juce::jmax (peakOut, buffer.getMagnitude (c, 0, numSamples));
 
-    // GR 計算 (peakIn > peakOut の場合のみ正の GR)
+    if (! std::isfinite (peakOut))
+        peakOut = 0.0f;
+
+    // GR 計算 (peakInForGr > peakOut の場合のみ正の GR)
     float grDb = 0.0f;
-    if (peakIn > 1.0e-6f && peakOut > 1.0e-6f && peakIn > peakOut)
-        grDb = 20.0f * std::log10 (peakIn / peakOut);
+    if (peakInForGr > meterFloor && peakOut > meterFloor && peakInForGr > peakOut)
+        grDb = 20.0f * std::log10 (peakInForGr / peakOut);
+
+    if (! std::isfinite (grDb))
+        grDb = 0.0f;
+
     grPeakDb.store (grDb, std::memory_order_relaxed);
 
     // output gain
     buffer.applyGain (outGainLin);
 
-    juce::ignoreUnused (numSamples);
+    // 出力 peak [dBFS] — output gain 適用後の最終信号レベル (クリップ LED 判定用)
+    float peakFinal = 0.0f;
+    for (int c = 0; c < numChannels; ++c)
+        peakFinal = juce::jmax (peakFinal, buffer.getMagnitude (c, 0, numSamples));
+    if (! std::isfinite (peakFinal))
+        peakFinal = 0.0f;
+    outputPeakDb.store (juce::Decibels::gainToDecibels (peakFinal, -100.0f),
+                        std::memory_order_relaxed);
+}
+
+void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
+                                                    juce::MidiBuffer&)
+{
+    // bypass 時もメーター atomic を更新する。さもないと UI が最後の値を 1秒 hold し続けて
+    // 「数字が固まったまま」に見える。
+    juce::ScopedNoDenormals denormals;
+
+    const int numChannels = buffer.getNumChannels();
+    const int numSamples  = buffer.getNumSamples();
+
+    // 入力ピーク dBFS: bypass 時は素の入力 (gain ノブは適用されないため、processBlock とは pre/post の意味が同じになる)
+    float peakIn = 0.0f;
+    for (int c = 0; c < numChannels; ++c)
+        peakIn = juce::jmax (peakIn, buffer.getMagnitude (c, 0, numSamples));
+    if (! std::isfinite (peakIn))
+        peakIn = 0.0f;
+    inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
+
+    // bypass 中も delay line は時間を進める (bypass off に戻った瞬間の不整合を避ける)
+    for (int c = 0; c < numChannels; ++c)
+    {
+        const auto* src = buffer.getReadPointer (c);
+        const int delayChannel = juce::jmin (c, 1);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            grMeterDelayLine.pushSample (delayChannel, src[i]);
+            (void) grMeterDelayLine.popSample (delayChannel);
+        }
+    }
+
+    // bypass 中は GR なし
+    grPeakDb.store (0.0f, std::memory_order_relaxed);
+
+    // bypass 中の出力 peak は入力と同じ (素通り)
+    outputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f),
+                        std::memory_order_relaxed);
 }
 
 juce::AudioProcessorEditor* KyoheiClipperProcessor::createEditor()

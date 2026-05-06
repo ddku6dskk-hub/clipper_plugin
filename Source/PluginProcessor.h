@@ -15,6 +15,7 @@ public:
     void releaseResources() override {}
     bool isBusesLayoutSupported (const BusesLayout&) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
@@ -43,12 +44,16 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
-    // GR (Gain Reduction) 量 [dB] — input gain 適用後 peak と output gain 適用前 peak の差
+    // GR (Gain Reduction) 量 [dB] — latency-aligned input peak と output gain 適用前 peak の差
     // UI 側で Timer から読み取って描画する
     std::atomic<float> grPeakDb { 0.0f };
 
     // 入力サンプルピーク [dBFS] — input gain 適用後 (= ユーザーが設定した Input ノブ反映済み)
     std::atomic<float> inputPeakDb { -100.0f };
+
+    // 出力サンプルピーク [dBFS] — output gain 適用後 (= 後段に送る最終信号レベル)
+    // クリップ LED 判定 (0 dBFS 超え) に使う
+    std::atomic<float> outputPeakDb { -100.0f };
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
@@ -57,6 +62,8 @@ private:
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
     std::array<kyohei::dsp::LookaheadLimiter<float>, 2> limiters; // stereo L/R
     std::array<kyohei::dsp::ClipperChain<float>, 2> chains;       // stereo L/R
+
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> grMeterDelayLine;
 
     std::atomic<float>* pThreshold = nullptr;
     std::atomic<float>* pKnee = nullptr;
