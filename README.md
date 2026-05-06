@@ -25,6 +25,10 @@ Both share a C2-Hermite soft-clip shaper and three Modes:
 Four sliders (Threshold / Knee / Input / Output), a Mode selector,
 and a GR meter (0–12 dB, 30 Hz refresh, peak hold 1 s).
 
+The meter shows latency-aligned input/output peaks plus an HA-style **CLIP**
+indicator that lights when the output exceeds 0 dBFS. The input readout turns
+red when the input reaches 0 dBFS.
+
 ---
 
 ## Build

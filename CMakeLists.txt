@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "minimum macOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "build universal binary (Apple Silicon + Intel)")
 
-project(KyoheiClipper VERSION 1.0.0 LANGUAGES CXX)
+project(KyoheiClipper VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +19,7 @@ add_compile_options(
     -fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.
 )
 
-add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../JUCE JUCE)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../_sdk/JUCE JUCE)
 
 # ============================================================
 # AAX SDK 自動検出 (任意)
@@ -37,7 +37,9 @@ if(NOT DEFINED AAX_SDK_PATH AND DEFINED ENV{AAX_SDK_PATH})
 endif()
 
 if(NOT DEFINED AAX_SDK_PATH)
-    file(GLOB _aax_candidates "$ENV{HOME}/SDKs/AAX_SDK_*"
+    file(GLOB _aax_candidates "$ENV{HOME}/Developer/_sdk/AAX_SDK_*"
+                              "$ENV{HOME}/Developer/_sdk/AAX-SDK-*"
+                              "$ENV{HOME}/SDKs/AAX_SDK_*"
                               "$ENV{HOME}/SDKs/AAX-SDK-*"
                               "$ENV{HOME}/Developer/AAX_SDK_*")
     list(SORT _aax_candidates COMPARE NATURAL ORDER DESCENDING) # 最新版を先頭に (10.0 > 9.0)
