@@ -3,7 +3,7 @@
 Open-source JUCE-based audio plug-ins: a transparent mastering clipper (**K Clipper**)
 and a transient-preserving drum/bass clipper (**K Slammer**).
 
-Formats: **VST3 / AU / AAX / Standalone** (macOS, Windows target planned).
+Formats: **VST3 / AU / AAX / Standalone** (macOS only).
 
 ---
 
@@ -65,7 +65,7 @@ Restart Pro Tools and accept the AAX Trust dialog if shown.
 Requires:
 
 - CMake 3.22+
-- Xcode 15+ (macOS) or MSVC (Windows)
+- Xcode 15+ (macOS)
 - [JUCE](https://github.com/juce-framework/JUCE) as a sibling directory (`../JUCE`)
 - (Optional) AAX SDK 2.9.0+ for AAX target — see `CMakeLists.txt` for auto-detection paths
 
