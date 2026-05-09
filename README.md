@@ -31,6 +31,35 @@ red when the input reaches 0 dBFS.
 
 ---
 
+## Installation (macOS, AAX)
+
+The release zip contains `K Clipper.aaxplugin` and `K Slammer.aaxplugin`.
+Copy them into Pro Tools' AAX folder:
+
+```sh
+sudo ditto "K Clipper.aaxplugin"  "/Library/Application Support/Avid/Audio/Plug-Ins/K Clipper.aaxplugin"
+sudo ditto "K Slammer.aaxplugin"  "/Library/Application Support/Avid/Audio/Plug-Ins/K Slammer.aaxplugin"
+```
+
+Because the binaries are signed with a free **Apple Development** certificate
+(not notarized — this is a non-commercial GPL build), macOS attaches a
+quarantine attribute when the zip is downloaded via a browser. This causes
+Pro Tools' AAX Trust to reject the bundle on launch and move it to
+`Plug-Ins (Unused)`. Clear quarantine after copying:
+
+```sh
+sudo xattr -cr "/Library/Application Support/Avid/Audio/Plug-Ins/K Clipper.aaxplugin"
+sudo xattr -cr "/Library/Application Support/Avid/Audio/Plug-Ins/K Slammer.aaxplugin"
+```
+
+Restart Pro Tools and accept the AAX Trust dialog if shown.
+
+> **Tip:** always extract the release zip with `ditto -x -k <zip> <dest>`
+> rather than the Finder's archive utility — Finder's expander dereferences
+> the PACE signature symlinks and silently breaks the resource seal.
+
+---
+
 ## Build
 
 Requires:
