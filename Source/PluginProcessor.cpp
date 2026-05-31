@@ -18,6 +18,12 @@ KyoheiClipperProcessor::KyoheiClipperProcessor()
     pMode       = apvts.getRawParameterValue ("mode");
     pInputGain  = apvts.getRawParameterValue ("inputGain");
     pOutputGain = apvts.getRawParameterValue ("outputGain");
+    pBypass     = apvts.getRawParameterValue ("bypass");
+}
+
+juce::AudioProcessorParameter* KyoheiClipperProcessor::getBypassParameter() const
+{
+    return apvts.getParameter ("bypass");
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
@@ -58,6 +64,11 @@ KyoheiClipperProcessor::createLayout()
         ParameterID {"outputGain", 1}, "Output",
         NormalisableRange<float> (-12.0f, 12.0f, 0.1f), 0.0f,
         AudioParameterFloatAttributes().withLabel ("dB")));
+
+    // 末尾に追加 (既存パラメータの順序/ID を変えず後方互換を維持)。
+    // getBypassParameter() で host bypass に紐づく soft-bypass フラグ。
+    params.push_back (std::make_unique<AudioParameterBool> (
+        ParameterID {"bypass", 1}, "Bypass", false));
 
     return { params.begin(), params.end() };
 }
@@ -123,6 +134,19 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     grMeterDelayLine.setDelay ((float) reportedLatency);
     grMeterDelayLine.reset();
 
+    // soft-bypass: dry を wet と同じ reportedLatency だけ遅延して時間整合する専用ライン。
+    // grMeterDelayLine とは別 (あちらは input gain 後、こちらは input gain 前の素入力)。
+    dryDelayLine.setMaximumDelayInSamples (juce::jmax (1, reportedLatency + 1));
+    dryDelayLine.prepare (meterSpec);                 // numChannels = 2
+    dryDelayLine.setDelay ((float) reportedLatency);  // reportedLatency==0 でも setDelay(0) で退化
+    dryDelayLine.reset();
+
+    dryScratch.setSize (2, samplesPerBlock, false, false, true);
+    dryScratch.clear();
+
+    bypassMix.reset (sampleRate, 0.015); // 15ms ランプ
+    bypassMix.setCurrentAndTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
+
     grPeakDb.store    (0.0f,    std::memory_order_relaxed);
     inputPeakDb.store (-100.0f, std::memory_order_relaxed);
     outputPeakDb.store (-100.0f, std::memory_order_relaxed);
@@ -160,6 +184,21 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
+
+    // --- soft bypass: 素入力(input gain 前)を dry として確保し、wet と同じ reportedLatency
+    //     だけ遅延させて時間整合する。bypass 状態に関わらず毎ブロック回してウォーム維持。 ---
+    bypassMix.setTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
+    for (int c = 0; c < numChannels; ++c)
+    {
+        const auto* src = buffer.getReadPointer (c);
+        auto* dst = dryScratch.getWritePointer (c);
+        const int dch = juce::jmin (c, 1);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            dryDelayLine.pushSample (dch, src[i]);
+            dst[i] = dryDelayLine.popSample (dch);
+        }
+    }
 
     // input gain
     buffer.applyGain (inGainLin);
@@ -234,12 +273,32 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (! std::isfinite (grDb))
         grDb = 0.0f;
 
-    grPeakDb.store (grDb, std::memory_order_relaxed);
-
     // output gain
     buffer.applyGain (outGainLin);
 
-    // 出力 peak [dBFS] — output gain 適用後の最終信号レベル (クリップ LED 判定用)
+    // --- soft bypass crossfade: wet(buffer) ↔ 遅延 dry(dryScratch) ---
+    // frame ごとに bypassMix を1回進めて全ch共通に適用。time-align 済みなのでクリックレス。
+    // active 継続中(mix=0 かつ非平滑)はループを省いて従来どおり wet を素通し。
+    float mixEnd = bypassMix.getCurrentValue();
+    if (bypassMix.isSmoothing() || mixEnd > 0.0f)
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float m = bypassMix.getNextValue();
+            const float wetGain = 1.0f - m;
+            for (int c = 0; c < numChannels; ++c)
+            {
+                auto* w = buffer.getWritePointer (c);
+                w[i] = w[i] * wetGain + dryScratch.getReadPointer (c)[i] * m;
+            }
+        }
+        mixEnd = bypassMix.getCurrentValue();
+    }
+
+    // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)
+    grPeakDb.store (grDb * (1.0f - mixEnd), std::memory_order_relaxed);
+
+    // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)
     float peakFinal = 0.0f;
     for (int c = 0; c < numChannels; ++c)
         peakFinal = juce::jmax (peakFinal, buffer.getMagnitude (c, 0, numSamples));
@@ -252,39 +311,34 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
                                                     juce::MidiBuffer&)
 {
-    // bypass 時もメーター atomic を更新する。さもないと UI が最後の値を 1秒 hold し続けて
-    // 「数字が固まったまま」に見える。
+    // getBypassParameter() を提供しているため、通常ホストはこの関数を呼ばず、host bypass は
+    // processBlock 内の bypassMix クロスフェードで処理される。ただしフォーマット/ホスト差分の
+    // 保険として、ここでも reportedLatency 分だけ信号を遅延させて出力し、active 時との
+    // 時間ジャンプ (ポップ) を防ぐ。
     juce::ScopedNoDenormals denormals;
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
 
-    // 入力ピーク dBFS: bypass 時は素の入力 (gain ノブは適用されないため、processBlock とは pre/post の意味が同じになる)
     float peakIn = 0.0f;
     for (int c = 0; c < numChannels; ++c)
-        peakIn = juce::jmax (peakIn, buffer.getMagnitude (c, 0, numSamples));
-    if (! std::isfinite (peakIn))
-        peakIn = 0.0f;
-    inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
-
-    // bypass 中も delay line は時間を進める (bypass off に戻った瞬間の不整合を避ける)
-    for (int c = 0; c < numChannels; ++c)
     {
-        const auto* src = buffer.getReadPointer (c);
-        const int delayChannel = juce::jmin (c, 1);
+        auto* d = buffer.getWritePointer (c);
+        const int dch = juce::jmin (c, 1);
         for (int i = 0; i < numSamples; ++i)
         {
-            grMeterDelayLine.pushSample (delayChannel, src[i]);
-            (void) grMeterDelayLine.popSample (delayChannel);
+            dryDelayLine.pushSample (dch, d[i]);
+            d[i] = dryDelayLine.popSample (dch);  // latency 整合済みの素通し
+            peakIn = juce::jmax (peakIn, std::abs (d[i]));
         }
     }
+    if (! std::isfinite (peakIn))
+        peakIn = 0.0f;
 
-    // bypass 中は GR なし
-    grPeakDb.store (0.0f, std::memory_order_relaxed);
-
-    // bypass 中の出力 peak は入力と同じ (素通り)
-    outputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f),
-                        std::memory_order_relaxed);
+    const float db = juce::Decibels::gainToDecibels (peakIn, -100.0f);
+    inputPeakDb.store  (db,   std::memory_order_relaxed);
+    grPeakDb.store     (0.0f, std::memory_order_relaxed); // bypass 中は GR なし
+    outputPeakDb.store (db,   std::memory_order_relaxed);
 }
 
 juce::AudioProcessorEditor* KyoheiClipperProcessor::createEditor()

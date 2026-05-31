@@ -20,6 +20,10 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
+    // ホスト bypass を内部 soft-bypass パラメータに紐づける。これにより host bypass 時も
+    // processBlock が呼ばれ続け、wet↔dry をクロスフェードしてクリックレスにできる。
+    juce::AudioProcessorParameter* getBypassParameter() const override;
+
     const juce::String getName() const override
     {
 #if KYOHEI_SLAMMER
@@ -65,11 +69,20 @@ private:
 
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> grMeterDelayLine;
 
+    // --- click-free soft bypass ---
+    // dry(input gain 適用前の素入力)を wet と同じ reportedLatency だけ遅延させて時間整合し、
+    // bypassMix で per-sample クロスフェードする。bypass 状態に関わらず常時 DSP を回すことで
+    // 復帰時の OS/IIR/limiter 状態不連続も防ぐ。
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> dryDelayLine;
+    juce::SmoothedValue<float> bypassMix;   // 0 = active, 1 = bypassed (15ms ramp)
+    juce::AudioBuffer<float> dryScratch;    // 遅延済み dry の一時保持 (wet 処理後に混ぜる)
+
     std::atomic<float>* pThreshold = nullptr;
     std::atomic<float>* pKnee = nullptr;
     std::atomic<float>* pMode = nullptr;
     std::atomic<float>* pInputGain = nullptr;
     std::atomic<float>* pOutputGain = nullptr;
+    std::atomic<float>* pBypass = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KyoheiClipperProcessor)
 };

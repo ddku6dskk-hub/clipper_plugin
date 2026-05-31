@@ -154,22 +154,13 @@ void KyoheiClipperEditor::timerCallback()
 
 void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> bounds)
 {
-    constexpr float maxDb = 12.0f;
+    constexpr float maxDb = 9.0f;
 
     // 背景
     g.setColour (juce::Colour::fromRGB (16, 16, 20));
     g.fillRect (bounds);
     g.setColour (juce::Colour::fromRGB (60, 60, 70));
     g.drawRect (bounds, 1);
-
-    // 目盛 (3, 6, 9 dB)
-    g.setColour (juce::Colour::fromRGB (45, 45, 55));
-    for (float tick : { 3.0f, 6.0f, 9.0f })
-    {
-        const float yFrac = tick / maxDb;
-        const int y = bounds.getY() + (int) std::round (yFrac * bounds.getHeight());
-        g.drawHorizontalLine (y, (float) bounds.getX(), (float) bounds.getRight());
-    }
 
     // 現在値バー (上から下へ伸びる、緑→黄→赤)
     const float curClamped = juce::jlimit (0.0f, maxDb, grSmoothed);
