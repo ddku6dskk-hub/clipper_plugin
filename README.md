@@ -33,8 +33,8 @@ red when the input reaches 0 dBFS.
 
 ## Installation (macOS, AAX)
 
-The release zip contains `K Clipper.aaxplugin` and `K Slammer.aaxplugin`.
-Copy them into Pro Tools' AAX folder:
+The release `.dmg` contains `K Clipper.aaxplugin` and `K Slammer.aaxplugin`.
+Mount it, then copy the plug-ins into Pro Tools' AAX folder:
 
 ```sh
 sudo ditto "K Clipper.aaxplugin"  "/Library/Application Support/Avid/Audio/Plug-Ins/K Clipper.aaxplugin"
@@ -43,7 +43,7 @@ sudo ditto "K Slammer.aaxplugin"  "/Library/Application Support/Avid/Audio/Plug-
 
 Because the binaries are signed with a free **Apple Development** certificate
 (not notarized — this is a non-commercial GPL build), macOS attaches a
-quarantine attribute when the zip is downloaded via a browser. This causes
+quarantine attribute when the `.dmg` is downloaded via a browser. This causes
 Pro Tools' AAX Trust to reject the bundle on launch and move it to
 `Plug-Ins (Unused)`. Clear quarantine after copying:
 
@@ -54,9 +54,9 @@ sudo xattr -cr "/Library/Application Support/Avid/Audio/Plug-Ins/K Slammer.aaxpl
 
 Restart Pro Tools and accept the AAX Trust dialog if shown.
 
-> **Tip:** always extract the release zip with `ditto -x -k <zip> <dest>`
-> rather than the Finder's archive utility — Finder's expander dereferences
-> the PACE signature symlinks and silently breaks the resource seal.
+> **Tip:** copy the plug-ins out of the mounted `.dmg` with `sudo ditto`
+> (as shown above) rather than dragging in the Finder — `ditto` preserves the
+> PACE signature symlinks, so the resource seal stays intact.
 
 ---
 

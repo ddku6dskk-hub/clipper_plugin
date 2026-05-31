@@ -37,7 +37,10 @@ public:
     {
         L = std::max (1, lookaheadSamples);
         audioDelay.assign ((size_t) (L + 1), SampleType (0));
-        dqBuf.assign ((size_t) (L + 1), DqEntry{});
+        // sliding-max deque は push→front-evict の順で動くため、evict 前に一時的に
+        // L+2 要素を保持しうる (有効窓 L+1 + push した新要素)。容量 L+1 だと厳密単調減少
+        // 入力で最古要素を上書き破壊し peak を過小評価する → +1 して L+2 を確保。
+        dqBuf.assign ((size_t) (L + 2), DqEntry{});
         writePos = 0;
         dqHead = 0;
         dqTail = 0;
