@@ -73,6 +73,11 @@ public:
 
     int getLatencySamples() const noexcept { return L; }
 
+    // 直近 process() で出力サンプルに乗せたゲイン係数 (≤1)。GR メーター用。
+    // 出力サンプルに対し時間整合済みなので、入出力ピーク比のような位相/FIR 由来の
+    // 偽 GR を含まない「実際に潰した量」そのもの。
+    SampleType getLastGain() const noexcept { return smoothGR; }
+
     SampleType process (SampleType x) noexcept
     {
         const SampleType ax = std::abs (x);

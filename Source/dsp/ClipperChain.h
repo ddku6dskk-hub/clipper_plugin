@@ -49,6 +49,7 @@ public:
         lfShelf.reset();
         envFollower.reset();
         lastLfGainDb = (SampleType) 1000; // 番兵値に戻す
+        lastShaperGain = (SampleType) 1;  // GR メーター用ゲインも初期化
     }
 
     void setMode (Mode m) { mode = m; }
@@ -69,14 +70,18 @@ public:
         switch (mode)
         {
             case Mode::BrickWall:
-                return symmetricSoftClip (x, thresholdLin, kneeLin);
+            {
+                const SampleType y = symmetricSoftClip (x, thresholdLin, kneeLin);
+                measureShaper (x, y);
+                return y;
+            }
 
             case Mode::Open:
             {
-                auto y = openShelf.processPre (x);
-                y = symmetricSoftClip (y, thresholdLin, kneeLin);
-                y = openShelf.processPost (y);
-                return y;
+                const auto pre = openShelf.processPre (x);
+                const auto shaped = symmetricSoftClip (pre, thresholdLin, kneeLin);
+                measureShaper (pre, shaped);
+                return openShelf.processPost (shaped);
             }
 
             case Mode::LFClipper:
@@ -97,16 +102,35 @@ public:
                     lastLfGainDb = g;
                 }
 
-                auto y = lfShelf.processPre (x);
-                y = symmetricSoftClip (y, thresholdLin, kneeLin);
-                y = lfShelf.processPost (y);
-                return y;
+                const auto pre = lfShelf.processPre (x);
+                const auto shaped = symmetricSoftClip (pre, thresholdLin, kneeLin);
+                measureShaper (pre, shaped);
+                return lfShelf.processPost (shaped);
             }
         }
         return x;
     }
 
+    // 直近 process() で shaper が実際に適用したゲイン係数 (≤1)。GR メーター用。
+    // shaper はメモリレスなので入出力比がそのまま「潰した量」になる (時間ズレなし)。
+    // shelf や OS の FIR/位相は GR に含めない (それらはゲインリダクションではない)。
+    SampleType getLastShaperGain() const noexcept { return lastShaperGain; }
+
 private:
+    void measureShaper (SampleType in, SampleType out) noexcept
+    {
+        const SampleType ain = std::abs (in);
+        if (ain > (SampleType) 1e-9)
+        {
+            const SampleType g = std::abs (out) / ain;
+            lastShaperGain = g < (SampleType) 1 ? g : (SampleType) 1;
+        }
+        else
+        {
+            lastShaperGain = (SampleType) 1;
+        }
+    }
+
     void updateKneeLin() noexcept
     {
         // 正しい dB→linear 変換: knee を threshold 上下に ±kneeDb/2 dB 分の幅で展開
@@ -121,6 +145,7 @@ private:
     SampleType kneeDb = (SampleType) 0;
     SampleType kneeLin = (SampleType) 0;
     SampleType lastLfGainDb = (SampleType) 1000; // 初回は必ず更新させるための番兵
+    SampleType lastShaperGain = (SampleType) 1;  // 直近 shaper 適用ゲイン (GR メーター用)
 
     LinkedShelf<SampleType> openShelf;
     LinkedShelf<SampleType> lfShelf;

@@ -2,11 +2,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-namespace
-{
-    constexpr float meterFloor = 1.0e-4f;
-}
-
 KyoheiClipperProcessor::KyoheiClipperProcessor()
     : juce::AudioProcessor (BusesProperties()
         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -79,7 +74,7 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     // Slammer: 4x OS、トランジェント重視、lookahead なし
     const int osFactor = 2; // 2^2 = 4x
 #else
-    // Clipper: 16x OS + lookahead で TDR 同等の透明さ
+    // Clipper: 16x OS + lookahead で透明な音圧最大化を狙う
     const int osFactor = 4; // 2^4 = 16x
 #endif
     oversampler = std::make_unique<juce::dsp::Oversampling<float>> (
@@ -129,13 +124,7 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     meterSpec.maximumBlockSize = (juce::uint32) samplesPerBlock;
     meterSpec.numChannels = 2;
 
-    grMeterDelayLine.setMaximumDelayInSamples (juce::jmax (1, reportedLatency + 1));
-    grMeterDelayLine.prepare (meterSpec);
-    grMeterDelayLine.setDelay ((float) reportedLatency);
-    grMeterDelayLine.reset();
-
     // soft-bypass: dry を wet と同じ reportedLatency だけ遅延して時間整合する専用ライン。
-    // grMeterDelayLine とは別 (あちらは input gain 後、こちらは input gain 前の素入力)。
     dryDelayLine.setMaximumDelayInSamples (juce::jmax (1, reportedLatency + 1));
     dryDelayLine.prepare (meterSpec);                 // numChannels = 2
     dryDelayLine.setDelay ((float) reportedLatency);  // reportedLatency==0 でも setDelay(0) で退化
@@ -213,29 +202,16 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
 
-    // GR 用 input peak は reported latency と同じ DelayLine で出力 peak と時間整合させる。
-    float peakInForGr = 0.0f;
-    for (int c = 0; c < numChannels; ++c)
-    {
-        const auto* src = buffer.getReadPointer (c);
-        const int delayChannel = juce::jmin (c, 1);
-
-        for (int i = 0; i < numSamples; ++i)
-        {
-            grMeterDelayLine.pushSample (delayChannel, src[i]);
-            const float delayed = grMeterDelayLine.popSample (delayChannel);
-            peakInForGr = juce::jmax (peakInForGr, std::abs (delayed));
-        }
-    }
-
-    if (! std::isfinite (peakInForGr))
-        peakInForGr = 0.0f;
-
     // oversample up
     juce::dsp::AudioBlock<float> block (buffer);
     auto osBlock = oversampler->processSamplesUp (block);
 
     const int osNumSamples = (int) osBlock.getNumSamples();
+
+    // GR は「各段が実際に適用したゲイン係数」を OS ドメイン内で直接測る (= 大手と同方式)。
+    // up/down サンプリングの FIR リンギングや位相回しはこのループの外側なので構造的に混入せず、
+    // 閾値以下の素通し区間では blockMinGain == 1 (= 0 dB) になる。
+    float blockMinGain = 1.0f;
     for (int c = 0; c < numChannels; ++c)
     {
         auto* data = osBlock.getChannelPointer ((size_t) c);
@@ -244,31 +220,32 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 #if KYOHEI_SLAMMER
         // Slammer: ドラム用途向けに shaper のみ（lookahead なし）でトランジェント保持
         for (int i = 0; i < osNumSamples; ++i)
+        {
             data[i] = chain.process (data[i]);
+            blockMinGain = juce::jmin (blockMinGain, chain.getLastShaperGain());
+        }
 #else
         auto& limiter = limiters[chIdx];
         // 段1: look-ahead True-Peak limiter で大きな山を均す
         // 段2: soft clipper がすり抜けた速いトランジェントを仕上げ
         for (int i = 0; i < osNumSamples; ++i)
-            data[i] = chain.process (limiter.process (data[i]));
+        {
+            const float limited = limiter.process (data[i]);
+            data[i] = chain.process (limited);
+            // 総 GR = limiter 適用ゲイン × shaper 適用ゲイン (どちらも出力サンプルに整合済み)
+            blockMinGain = juce::jmin (blockMinGain,
+                                       limiter.getLastGain() * chain.getLastShaperGain());
+        }
 #endif
     }
 
     // oversample down
     oversampler->processSamplesDown (block);
 
-    // GR 計測用: クリップ後 peak (output gain 適用前)
-    float peakOut = 0.0f;
-    for (int c = 0; c < numChannels; ++c)
-        peakOut = juce::jmax (peakOut, buffer.getMagnitude (c, 0, numSamples));
-
-    if (! std::isfinite (peakOut))
-        peakOut = 0.0f;
-
-    // GR 計算 (peakInForGr > peakOut の場合のみ正の GR)
+    // GR [dB] = 潰した量。blockMinGain ∈ (0,1] を dB 化 (素通し時は 0 dB)。
     float grDb = 0.0f;
-    if (peakInForGr > meterFloor && peakOut > meterFloor && peakInForGr > peakOut)
-        grDb = 20.0f * std::log10 (peakInForGr / peakOut);
+    if (blockMinGain > 0.0f && blockMinGain < 1.0f)
+        grDb = -20.0f * std::log10 (blockMinGain);
 
     if (! std::isfinite (grDb))
         grDb = 0.0f;

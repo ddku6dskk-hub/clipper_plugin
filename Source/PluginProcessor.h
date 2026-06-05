@@ -48,7 +48,8 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
-    // GR (Gain Reduction) 量 [dB] — latency-aligned input peak と output gain 適用前 peak の差
+    // GR (Gain Reduction) 量 [dB] — limiter/shaper が OS ドメインで実際に適用したゲイン係数から
+    // 直接算出 (入出力ピーク比ではない)。閾値以下の素通し区間は構造的に 0 dB。
     // UI 側で Timer から読み取って描画する
     std::atomic<float> grPeakDb { 0.0f };
 
@@ -66,8 +67,6 @@ private:
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
     std::array<kyohei::dsp::LookaheadLimiter<float>, 2> limiters; // stereo L/R
     std::array<kyohei::dsp::ClipperChain<float>, 2> chains;       // stereo L/R
-
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> grMeterDelayLine;
 
     // --- click-free soft bypass ---
     // dry(input gain 適用前の素入力)を wet と同じ reportedLatency だけ遅延させて時間整合し、
