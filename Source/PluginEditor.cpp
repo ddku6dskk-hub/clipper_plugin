@@ -44,6 +44,12 @@ KyoheiClipperEditor::KyoheiClipperEditor (KyoheiClipperProcessor& p)
     outAtt       = std::make_unique<SliderAttach> (proc.apvts, "outputGain", outputGainSlider);
     modeAtt      = std::make_unique<ChoiceAttach> (proc.apvts, "mode",       modeBox);
 
+    // GUI を閉じている間に peak-hold へ溜まった過去ピークを捨ててから描画開始する
+    // (開いた瞬間にメーターが過去の最大値へ跳ね上がるのを防ぐ)。
+    proc.grPeakDb.store     (0.0f,    std::memory_order_relaxed);
+    proc.inputPeakDb.store  (-100.0f, std::memory_order_relaxed);
+    proc.outputPeakDb.store (-100.0f, std::memory_order_relaxed);
+
     startTimerHz (30);
 }
 
@@ -98,7 +104,7 @@ void KyoheiClipperEditor::resized()
 void KyoheiClipperEditor::timerCallback()
 {
     // GR (Gain Reduction)
-    const float rawGr = proc.grPeakDb.load (std::memory_order_relaxed);
+    const float rawGr = proc.grPeakDb.exchange (0.0f, std::memory_order_relaxed);
     const float safeRawGr = (std::isfinite (rawGr) && rawGr >= 0.0f) ? rawGr : 0.0f;
     grSmoothed = juce::jmax (safeRawGr, grSmoothed * 0.82f);
     if (safeRawGr >= grPeakHold)
@@ -116,7 +122,7 @@ void KyoheiClipperEditor::timerCallback()
     }
 
     // 入力サンプルピーク (dBFS): attack 即時、release 緩やか、ピークホールド 1秒
-    const float rawIn = proc.inputPeakDb.load (std::memory_order_relaxed);
+    const float rawIn = proc.inputPeakDb.exchange (-100.0f, std::memory_order_relaxed);
     const float safeRawIn = std::isfinite (rawIn) ? juce::jlimit (-100.0f, 0.0f, rawIn) : -100.0f;
     inputPeakSmoothed = juce::jlimit (-100.0f, 0.0f,
                                       juce::jmax (safeRawIn, inputPeakSmoothed - 1.5f));
@@ -136,7 +142,7 @@ void KyoheiClipperEditor::timerCallback()
     }
 
     // クリップ LED: 出力 peak が 0 dBFS を超えたら点灯、30 frame (= 1秒) ホールド
-    float rawOut = proc.outputPeakDb.load (std::memory_order_relaxed);
+    float rawOut = proc.outputPeakDb.exchange (-100.0f, std::memory_order_relaxed);
     if (! std::isfinite (rawOut))
         rawOut = -100.0f;
     if (rawOut > 0.0f)

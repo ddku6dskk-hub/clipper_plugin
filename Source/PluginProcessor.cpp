@@ -2,6 +2,21 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+namespace
+{
+    // UI メーター用 peak-hold: audio thread から複数ブロック分のピークを取りこぼさず
+    // atomic に最大値として蓄積する。UI 側が読み取り時に exchange でリセットするので、
+    // 「UI が読みに来るまでの全ブロックの最大」が常に表示される (旧: 毎ブロック上書きで
+    // 最後のブロックしか見えず、PT メーターより低く出る取りこぼしがあった)。
+    inline void atomicPeakMax (std::atomic<float>& target, float value) noexcept
+    {
+        float cur = target.load (std::memory_order_relaxed);
+        while (value > cur
+               && ! target.compare_exchange_weak (cur, value, std::memory_order_relaxed))
+        {}
+    }
+}
+
 KyoheiClipperProcessor::KyoheiClipperProcessor()
     : juce::AudioProcessor (BusesProperties()
         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -192,7 +207,7 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     // input gain
     buffer.applyGain (inGainLin);
 
-    // 入力サンプルピーク (dBFS) は現在ブロックの値を UI に渡す。
+    // 入力サンプルピーク (dBFS)。peak-hold で UI が読み取るまでの全ブロック最大を保持。
     float peakIn = 0.0f;
     for (int c = 0; c < numChannels; ++c)
         peakIn = juce::jmax (peakIn, buffer.getMagnitude (c, 0, numSamples));
@@ -200,7 +215,7 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (! std::isfinite (peakIn))
         peakIn = 0.0f;
 
-    inputPeakDb.store (juce::Decibels::gainToDecibels (peakIn, -100.0f), std::memory_order_relaxed);
+    atomicPeakMax (inputPeakDb, juce::Decibels::gainToDecibels (peakIn, -100.0f));
 
     // oversample up
     juce::dsp::AudioBlock<float> block (buffer);
@@ -273,7 +288,7 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     }
 
     // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)
-    grPeakDb.store (grDb * (1.0f - mixEnd), std::memory_order_relaxed);
+    atomicPeakMax (grPeakDb, grDb * (1.0f - mixEnd));
 
     // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)
     float peakFinal = 0.0f;
@@ -281,8 +296,7 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
         peakFinal = juce::jmax (peakFinal, buffer.getMagnitude (c, 0, numSamples));
     if (! std::isfinite (peakFinal))
         peakFinal = 0.0f;
-    outputPeakDb.store (juce::Decibels::gainToDecibels (peakFinal, -100.0f),
-                        std::memory_order_relaxed);
+    atomicPeakMax (outputPeakDb, juce::Decibels::gainToDecibels (peakFinal, -100.0f));
 }
 
 void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
@@ -313,9 +327,9 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
         peakIn = 0.0f;
 
     const float db = juce::Decibels::gainToDecibels (peakIn, -100.0f);
-    inputPeakDb.store  (db,   std::memory_order_relaxed);
-    grPeakDb.store     (0.0f, std::memory_order_relaxed); // bypass 中は GR なし
-    outputPeakDb.store (db,   std::memory_order_relaxed);
+    atomicPeakMax (inputPeakDb, db);
+    grPeakDb.store (0.0f, std::memory_order_relaxed);     // bypass 中は GR なし
+    atomicPeakMax (outputPeakDb, db);
 }
 
 juce::AudioProcessorEditor* KyoheiClipperProcessor::createEditor()
