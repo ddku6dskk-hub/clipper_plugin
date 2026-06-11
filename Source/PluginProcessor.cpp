@@ -147,9 +147,14 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     dryScratch.setSize (2, samplesPerBlock, false, false, true);
     dryScratch.clear();
+    preparedBlockSize = samplesPerBlock;
 
     bypassMix.reset (sampleRate, 0.015); // 15ms ランプ
     bypassMix.setCurrentAndTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
+
+    // 再生開始時に古いゲインから不要なランプがかからないよう現在値で初期化
+    lastInGain  = juce::Decibels::decibelsToGain (pInputGain  != nullptr ? pInputGain->load()  : 0.0f);
+    lastOutGain = juce::Decibels::decibelsToGain (pOutputGain != nullptr ? pOutputGain->load() : 0.0f);
 
     grPeakDb.store    (0.0f,    std::memory_order_relaxed);
     inputPeakDb.store (-100.0f, std::memory_order_relaxed);
@@ -168,6 +173,29 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 {
     juce::ScopedNoDenormals denormals;
 
+    // dryScratch/oversampler の確保量は prepareToPlay の samplesPerBlock 前提。
+    // 超過ブロックを渡す契約違反ホストでもオーバーランしないよう、確保済みサイズ以下に
+    // 分割して処理する (alloc なし: chunk は元バッファ参照のビュー)。通常ホストは1チャンク。
+    const int totalSamples = buffer.getNumSamples();
+    const int numChannels  = buffer.getNumChannels();
+    const int maxChunk     = preparedBlockSize > 0 ? preparedBlockSize : totalSamples;
+
+    if (totalSamples <= maxChunk)
+    {
+        processChunk (buffer);
+        return;
+    }
+
+    for (int offset = 0; offset < totalSamples; offset += maxChunk)
+    {
+        const int len = juce::jmin (maxChunk, totalSamples - offset);
+        juce::AudioBuffer<float> chunk (buffer.getArrayOfWritePointers(), numChannels, offset, len);
+        processChunk (chunk);
+    }
+}
+
+void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
+{
     const auto mode = static_cast<kyohei::dsp::ClipperChain<float>::Mode> ((int) pMode->load());
     const float threshDb = pThreshold->load();
     const float kneeDb   = pKnee->load();
@@ -204,8 +232,9 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
         }
     }
 
-    // input gain
-    buffer.applyGain (inGainLin);
+    // input gain — 前ブロック値から線形ランプ (ブロック境界の段差 = ジッパーノイズ防止)
+    buffer.applyGainRamp (0, numSamples, lastInGain, inGainLin);
+    lastInGain = inGainLin;
 
     // 入力サンプルピーク (dBFS)。peak-hold で UI が読み取るまでの全ブロック最大を保持。
     float peakIn = 0.0f;
@@ -265,8 +294,9 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (! std::isfinite (grDb))
         grDb = 0.0f;
 
-    // output gain
-    buffer.applyGain (outGainLin);
+    // output gain — input 側と同様にランプ適用
+    buffer.applyGainRamp (0, numSamples, lastOutGain, outGainLin);
+    lastOutGain = outGainLin;
 
     // --- soft bypass crossfade: wet(buffer) ↔ 遅延 dry(dryScratch) ---
     // frame ごとに bypassMix を1回進めて全ch共通に適用。time-align 済みなのでクリックレス。
@@ -330,6 +360,11 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     atomicPeakMax (inputPeakDb, db);
     grPeakDb.store (0.0f, std::memory_order_relaxed);     // bypass 中は GR なし
     atomicPeakMax (outputPeakDb, db);
+
+    // hard bypass 中も gain 履歴をパラメータに追従させ、active 復帰ブロックで
+    // 古い値からの catch-up ランプが走らないようにする
+    lastInGain  = juce::Decibels::decibelsToGain (pInputGain  != nullptr ? pInputGain->load()  : 0.0f);
+    lastOutGain = juce::Decibels::decibelsToGain (pOutputGain != nullptr ? pOutputGain->load() : 0.0f);
 }
 
 juce::AudioProcessorEditor* KyoheiClipperProcessor::createEditor()

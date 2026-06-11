@@ -76,6 +76,19 @@ private:
     juce::SmoothedValue<float> bypassMix;   // 0 = active, 1 = bypassed (15ms ramp)
     juce::AudioBuffer<float> dryScratch;    // 遅延済み dry の一時保持 (wet 処理後に混ぜる)
 
+    // processBlock 1回分の実処理。numSamples <= preparedBlockSize が前提
+    // (processBlock 側で分割保証済み)。
+    void processChunk (juce::AudioBuffer<float>&);
+
+    // prepareToPlay で告知された最大ブロック長。dryScratch/oversampler の確保量はこれ前提
+    // なので、超過ブロックを渡す契約違反ホストでは processBlock がこのサイズに分割処理する。
+    int preparedBlockSize = 0;
+
+    // input/output gain の前ブロック適用値。applyGainRamp で今ブロック値へ線形補間し、
+    // オートメーション/ノブ操作時のブロック境界段差 (ジッパーノイズ) を防ぐ。
+    float lastInGain  = 1.0f;
+    float lastOutGain = 1.0f;
+
     std::atomic<float>* pThreshold = nullptr;
     std::atomic<float>* pKnee = nullptr;
     std::atomic<float>* pMode = nullptr;

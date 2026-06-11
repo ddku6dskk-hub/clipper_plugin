@@ -52,7 +52,21 @@ public:
         lastShaperGain = (SampleType) 1;  // GR メーター用ゲインも初期化
     }
 
-    void setMode (Mode m) { mode = m; }
+    void setMode (Mode m)
+    {
+        if (m != mode)
+        {
+            // 旧モードで溜まった shelf/env の残留状態を破棄し、復帰時の挙動を決定論化する。
+            // (波形整形カーブ自体が瞬時に変わるため切替の不連続は本質的に残る — 大手も同じ。
+            //  これは「残留状態由来の余計な過渡」だけを排除する措置)
+            // 係数次数は不変なので IIR::reset() は alloc なし = RT-safe。
+            openShelf.reset();
+            lfShelf.reset();
+            envFollower.reset();
+            lastLfGainDb = (SampleType) 1000; // LF 復帰時に係数を必ず再計算させる
+        }
+        mode = m;
+    }
     void setThresholdDb (SampleType dB)
     {
         thresholdDb = dB;
