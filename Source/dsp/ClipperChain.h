@@ -41,6 +41,12 @@ public:
                             (SampleType) 5.96, (SampleType) 5979, (SampleType) 0.72);
         lfShelf.setShelf (LinkedShelf<SampleType>::Kind::LowShelf,
                           (SampleType) 0, (SampleType) 2604, (SampleType) 0.37);
+
+        // threshold/knee 平滑化: 5ms 線形ランプ (input/output gain の applyGainRamp と
+        // 同じ思想のジッパー対策。従来はブロック単位ステップで shaper カーブが段差変化した)。
+        // reset 後の初回セットは即時反映なので、静的パラメータでは出力は従来と bit 一致。
+        threshSmooth.reset (spec.sampleRate, 0.005);
+        kneeSmooth.reset (spec.sampleRate, 0.005);
     }
 
     void reset()
@@ -50,6 +56,8 @@ public:
         envFollower.reset();
         lastLfGainDb = (SampleType) 1000; // 番兵値に戻す
         lastShaperGain = (SampleType) 1;  // GR メーター用ゲインも初期化
+        threshInit = false;               // 次の setThresholdDb/setKneeDb は即時反映
+        kneeInit = false;
     }
 
     void setMode (Mode m)
@@ -67,25 +75,44 @@ public:
         }
         mode = m;
     }
+    /** threshold 設定。reset 後の初回は即時反映、以降は 5ms 線形ランプ (ジッパー対策)。 */
     void setThresholdDb (SampleType dB)
     {
         thresholdDb = dB;
-        thresholdLin = std::pow ((SampleType) 10, dB / (SampleType) 20);
-        updateKneeLin();
+        const SampleType tLin = std::pow ((SampleType) 10, dB / (SampleType) 20);
+        if (threshInit)
+        {
+            threshSmooth.setTargetValue (tLin);
+        }
+        else
+        {
+            threshSmooth.setCurrentAndTargetValue (tLin);
+            threshInit = true;
+        }
+        updateKneeTarget (false);
     }
+    /** knee 設定。threshold と同様に平滑化される。 */
     void setKneeDb (SampleType dB)
     {
         kneeDb = dB;
-        updateKneeLin();
+        // knee 幅の線形換算: K_lin = T_lin·(1 − 10^(−kneeDb/20)) を threshold の上下に
+        // 半分ずつ展開する。dB 軸で厳密に ±kneeDb/2 ではなく「threshold 比の線形幅」と
+        // して定義した独自マッピング (実測フィット時からこの定義で一貫)。
+        kneeFactor = (SampleType) 1 - std::pow ((SampleType) 10, -dB / (SampleType) 20);
+        updateKneeTarget (true);
     }
 
     SampleType process (SampleType x) noexcept
     {
+        // 平滑化パラメータをサンプル単位で前進 (非平滑時は目標値をそのまま返すだけで安価)
+        const SampleType T = threshSmooth.getNextValue();
+        const SampleType K = kneeSmooth.getNextValue();
+
         switch (mode)
         {
             case Mode::BrickWall:
             {
-                const SampleType y = symmetricSoftClip (x, thresholdLin, kneeLin);
+                const SampleType y = symmetricSoftClip (x, T, K);
                 measureShaper (x, y);
                 return y;
             }
@@ -93,7 +120,7 @@ public:
             case Mode::Open:
             {
                 const auto pre = openShelf.processPre (x);
-                const auto shaped = symmetricSoftClip (pre, thresholdLin, kneeLin);
+                const auto shaped = symmetricSoftClip (pre, T, K);
                 measureShaper (pre, shaped);
                 return openShelf.processPost (shaped);
             }
@@ -101,8 +128,8 @@ public:
             case Mode::LFClipper:
             {
                 const SampleType env = envFollower.process (x);
-                const SampleType od = env > thresholdLin
-                    ? (SampleType) 20 * std::log10 (env / thresholdLin)
+                const SampleType od = env > T
+                    ? (SampleType) 20 * std::log10 (env / T)
                     : (SampleType) 0;
 
                 // 測定値: g(od) = max(-12, 0.66 - 0.657·od)
@@ -117,7 +144,7 @@ public:
                 }
 
                 const auto pre = lfShelf.processPre (x);
-                const auto shaped = symmetricSoftClip (pre, thresholdLin, kneeLin);
+                const auto shaped = symmetricSoftClip (pre, T, K);
                 measureShaper (pre, shaped);
                 return lfShelf.processPost (shaped);
             }
@@ -145,21 +172,40 @@ private:
         }
     }
 
-    void updateKneeLin() noexcept
+    /**
+     * kneeLin 目標値の再計算 (kneeLin = 目標 T_lin × kneeFactor)。
+     * kneeInit は setKneeDb 側でのみ立てる: reset 直後のブロックは
+     * setThresholdDb → setKneeDb の順で呼ばれるため、setThresholdDb 経由の
+     * スナップ (古い kneeFactor) を直後の setKneeDb が正しい値で上書きスナップし、
+     * 初回ブロックの先頭サンプルから正確な knee で動く。
+     */
+    void updateKneeTarget (bool fromKneeSetter) noexcept
     {
-        // 正しい dB→linear 変換: knee を threshold 上下に ±kneeDb/2 dB 分の幅で展開
-        // K_lin = T_lin * (1 - 10^(-kneeDb/20))
-        kneeLin = thresholdLin * ((SampleType) 1 - std::pow ((SampleType) 10, -kneeDb / (SampleType) 20));
+        const SampleType kLin = threshSmooth.getTargetValue() * kneeFactor;
+        if (kneeInit)
+        {
+            kneeSmooth.setTargetValue (kLin);
+        }
+        else
+        {
+            kneeSmooth.setCurrentAndTargetValue (kLin);
+            if (fromKneeSetter)
+                kneeInit = true;
+        }
     }
 
     double sampleRate = 48000.0;
     Mode mode = Mode::BrickWall;
     SampleType thresholdDb = (SampleType) -6;
-    SampleType thresholdLin = (SampleType) 0.5;
     SampleType kneeDb = (SampleType) 0;
-    SampleType kneeLin = (SampleType) 0;
+    SampleType kneeFactor = (SampleType) 0;      // 1 − 10^(−kneeDb/20)
     SampleType lastLfGainDb = (SampleType) 1000; // 初回は必ず更新させるための番兵
     SampleType lastShaperGain = (SampleType) 1;  // 直近 shaper 適用ゲイン (GR メーター用)
+
+    // threshold/knee の線形値スムーザー (5ms ランプ、prepare で reset)
+    juce::SmoothedValue<SampleType, juce::ValueSmoothingTypes::Linear> threshSmooth, kneeSmooth;
+    bool threshInit = false;  // reset 後の初回セットを即時反映にするフラグ
+    bool kneeInit = false;
 
     LinkedShelf<SampleType> openShelf;
     LinkedShelf<SampleType> lfShelf;

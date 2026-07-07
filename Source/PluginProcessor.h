@@ -56,8 +56,9 @@ public:
     // 入力サンプルピーク [dBFS] — input gain 適用後 (= ユーザーが設定した Input ノブ反映済み)
     std::atomic<float> inputPeakDb { -100.0f };
 
-    // 出力サンプルピーク [dBFS] — output gain 適用後 (= 後段に送る最終信号レベル)
-    // クリップ LED 判定 (0 dBFS 超え) に使う
+    // 出力ピーク [dBFS] — output gain 適用後の True-Peak 推定。ベースレート sample peak と
+    // 「OS ドメイン処理後ピーク × 出力ゲイン × wet 比率」の大きい方 (ダウンサンプルで生じる
+    // inter-sample peak の取りこぼし防止)。クリップ LED 判定 (0 dBFS 超え) に使う
     std::atomic<float> outputPeakDb { -100.0f };
 
 private:

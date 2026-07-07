@@ -4,7 +4,9 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "minimum macOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "build universal binary (Apple Silicon + Intel)")
 
-project(KyoheiClipper VERSION 1.0.7 LANGUAGES CXX)
+# LANGUAGES に C を含める: AAX SDK ラッパーが C ソースを含むため、AAX 自動検出時に
+# C 言語が未有効だと generate 段で CMAKE_C_COMPILE_OBJECT エラーになる (CMake 4.x)
+project(KyoheiClipper VERSION 1.0.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,9 +30,11 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../_sdk/JUCE JUCE)
 #   1. cmake -DAAX_SDK_PATH=/path/to/AAX_SDK_2.x.x で明示指定
 #   2. 環境変数 AAX_SDK_PATH
 #   3. ~/SDKs/AAX_SDK_* の最新版を自動検出
-# 見つからない場合: VST3/AU/Standalone のみ (現状互換)
+# 見つからない場合: VST3/AU のみ (現状互換)
 # ============================================================
-set(KYOHEI_FORMATS VST3 AU Standalone)
+# Standalone は v1.0.8 で廃止 (配布対象外。マイク権限まわりの Info.plist /
+# Hardened Runtime entitlement 整備コストに見合わないため)
+set(KYOHEI_FORMATS VST3 AU)
 
 if(NOT DEFINED AAX_SDK_PATH AND DEFINED ENV{AAX_SDK_PATH})
     set(AAX_SDK_PATH "$ENV{AAX_SDK_PATH}")

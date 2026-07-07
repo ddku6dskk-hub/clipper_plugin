@@ -119,7 +119,18 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     // look-ahead limiter: 0.2 ms 相当（OS レート基準）
     // スイープ実測 (推し活_M4 Open 6dB): 0.2ms が音圧最大スイートスポット (LUFS -7.24)
     // TP は +0.002dB の微超に収まる (可聴限界以下)。0.5ms 比 +0.04dB ホット
-    const int lookaheadSamplesOS = juce::roundToInt (0.0002 * osSampleRate);
+    //
+    // さらに「OS 群遅延 + look-ahead」の合計がベースレートで整数サンプルになるよう
+    // 0〜15 OS サンプル (≤0.02ms。スイープ感度 0.3ms 差で 0.04dB に対し無視できる量)
+    // だけ切り上げる。これで報告レイテンシ = 実レイテンシが厳密一致し、host PDC と
+    // soft-bypass の dry 整合からサブサンプル誤差 (クロスフェード中の微小コム) が消える。
+    const double osFactorLin = std::pow (2.0, osFactor);
+    const double osLatencyOS = (double) oversampler->getLatencyInSamples() * osFactorLin;
+    int lookaheadSamplesOS   = (int) std::ceil (0.0002 * osSampleRate);
+    const double fracOS = std::fmod (osLatencyOS + (double) lookaheadSamplesOS, osFactorLin);
+    if (fracOS > 1e-6 && osFactorLin - fracOS > 1e-6)
+        lookaheadSamplesOS += (int) std::llround (osFactorLin - fracOS);
+
     for (auto& lim : limiters)
     {
         lim.prepare (osSampleRate, lookaheadSamplesOS,
@@ -128,9 +139,10 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
         lim.reset();
     }
 
-    // 総レイテンシ: OS 群遅延 + limiter look-ahead (OS→base 換算)
-    const double limiterBaseLatency = (double) lookaheadSamplesOS / std::pow (2.0, osFactor);
-    const int reportedLatency = juce::roundToInt (oversampler->getLatencyInSamples() + limiterBaseLatency);
+    // 総レイテンシ: OS 群遅延 + limiter look-ahead (OS→base 換算)。上記の切り上げにより
+    // 通常は誤差ゼロの整数 (万一 OS 群遅延が OS サンプル非整数でも残差 < 1/16 サンプル)。
+    const int reportedLatency = juce::roundToInt (
+        (osLatencyOS + (double) lookaheadSamplesOS) / osFactorLin);
     setLatencySamples (reportedLatency);
 #endif
 
@@ -173,12 +185,17 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 {
     juce::ScopedNoDenormals denormals;
 
+    // prepareToPlay 前に呼ぶ契約違反ホスト対策: 未初期化の oversampler/delay line に
+    // 触らず素通しする (chunk 分割と同レベルの防御をここにも揃える)
+    if (oversampler == nullptr || preparedBlockSize <= 0)
+        return;
+
     // dryScratch/oversampler の確保量は prepareToPlay の samplesPerBlock 前提。
     // 超過ブロックを渡す契約違反ホストでもオーバーランしないよう、確保済みサイズ以下に
     // 分割して処理する (alloc なし: chunk は元バッファ参照のビュー)。通常ホストは1チャンク。
     const int totalSamples = buffer.getNumSamples();
     const int numChannels  = buffer.getNumChannels();
-    const int maxChunk     = preparedBlockSize > 0 ? preparedBlockSize : totalSamples;
+    const int maxChunk     = preparedBlockSize;
 
     if (totalSamples <= maxChunk)
     {
@@ -216,6 +233,17 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
+
+    // 非有限サンプル (NaN/Inf) は入口で 0 に潰す。LinkedShelf の IIR は NaN が 1 サンプル
+    // でも入るとフィードバック状態に残留し reset まで無音化するため (B.Wall はメモリレスで
+    // 自然復帰するが Open/LF は復帰しない)。メーター側 isfinite ガードと対になる音声側ガード。
+    for (int c = 0; c < numChannels; ++c)
+    {
+        auto* d = buffer.getWritePointer (c);
+        for (int i = 0; i < numSamples; ++i)
+            if (! std::isfinite (d[i]))
+                d[i] = 0.0f;
+    }
 
     // --- soft bypass: 素入力(input gain 前)を dry として確保し、wet と同じ reportedLatency
     //     だけ遅延させて時間整合する。bypass 状態に関わらず毎ブロック回してウォーム維持。 ---
@@ -255,7 +283,12 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     // GR は「各段が実際に適用したゲイン係数」を OS ドメイン内で直接測る (= 大手と同方式)。
     // up/down サンプリングの FIR リンギングや位相回しはこのループの外側なので構造的に混入せず、
     // 閾値以下の素通し区間では blockMinGain == 1 (= 0 dB) になる。
+    //
+    // osPeak: 処理後の OS ドメインピーク。ダウンサンプル前の帯域制限済み波形の最大値なので、
+    // ベースレート sample peak が取りこぼす inter-sample peak を含む True-Peak 推定になる
+    // (クリップ LED 判定用。ダウンサンプル FIR のリンギング超過 +0.002dB 実測のみ漏れる)。
     float blockMinGain = 1.0f;
+    float osPeak = 0.0f;
     for (int c = 0; c < numChannels; ++c)
     {
         auto* data = osBlock.getChannelPointer ((size_t) c);
@@ -267,6 +300,7 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
         {
             data[i] = chain.process (data[i]);
             blockMinGain = juce::jmin (blockMinGain, chain.getLastShaperGain());
+            osPeak = juce::jmax (osPeak, std::abs (data[i]));
         }
 #else
         auto& limiter = limiters[chIdx];
@@ -279,6 +313,7 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
             // 総 GR = limiter 適用ゲイン × shaper 適用ゲイン (どちらも出力サンプルに整合済み)
             blockMinGain = juce::jmin (blockMinGain,
                                        limiter.getLastGain() * chain.getLastShaperGain());
+            osPeak = juce::jmax (osPeak, std::abs (data[i]));
         }
 #endif
     }
@@ -295,14 +330,16 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
         grDb = 0.0f;
 
     // output gain — input 側と同様にランプ適用
+    const float outGainStart = lastOutGain;
     buffer.applyGainRamp (0, numSamples, lastOutGain, outGainLin);
     lastOutGain = outGainLin;
 
     // --- soft bypass crossfade: wet(buffer) ↔ 遅延 dry(dryScratch) ---
     // frame ごとに bypassMix を1回進めて全ch共通に適用。time-align 済みなのでクリックレス。
     // active 継続中(mix=0 かつ非平滑)はループを省いて従来どおり wet を素通し。
-    float mixEnd = bypassMix.getCurrentValue();
-    if (bypassMix.isSmoothing() || mixEnd > 0.0f)
+    const float mixStart = bypassMix.getCurrentValue();
+    float mixEnd = mixStart;
+    if (bypassMix.isSmoothing() || mixStart > 0.0f)
     {
         for (int i = 0; i < numSamples; ++i)
         {
@@ -320,10 +357,17 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)
     atomicPeakMax (grPeakDb, grDb * (1.0f - mixEnd));
 
-    // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)
+    // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)。
+    // ベースレート sample peak に加え、OS ドメイン処理後ピーク × 出力ゲイン × wet 比率の
+    // True-Peak 推定を合成して判定する (ダウンサンプルで生じる ISP の取りこぼし防止)。
+    // ゲイン/ミックスはブロック内で変動しうるため保守側 (大きいゲイン・wet 多い方) を採用。
+    // 全 bypass 中 (wet 比率 0) は従来どおり dry の sample peak にフォールバックする。
     float peakFinal = 0.0f;
     for (int c = 0; c < numChannels; ++c)
         peakFinal = juce::jmax (peakFinal, buffer.getMagnitude (c, 0, numSamples));
+    const float wetTp = osPeak * juce::jmax (outGainStart, outGainLin)
+                               * (1.0f - juce::jmin (mixStart, mixEnd));
+    peakFinal = juce::jmax (peakFinal, wetTp);
     if (! std::isfinite (peakFinal))
         peakFinal = 0.0f;
     atomicPeakMax (outputPeakDb, juce::Decibels::gainToDecibels (peakFinal, -100.0f));
@@ -338,6 +382,10 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     // 時間ジャンプ (ポップ) を防ぐ。
     juce::ScopedNoDenormals denormals;
 
+    // prepareToPlay 前は dryDelayLine が未確保のため触らない (processBlock と同じ防御)
+    if (preparedBlockSize <= 0)
+        return;
+
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
 
@@ -348,7 +396,10 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
         const int dch = juce::jmin (c, 1);
         for (int i = 0; i < numSamples; ++i)
         {
-            dryDelayLine.pushSample (dch, d[i]);
+            float v = d[i];
+            if (! std::isfinite (v))       // NaN/Inf は遅延線に入れない (processChunk と同基準)
+                v = 0.0f;
+            dryDelayLine.pushSample (dch, v);
             d[i] = dryDelayLine.popSample (dch);  // latency 整合済みの素通し
             peakIn = juce::jmax (peakIn, std::abs (d[i]));
         }

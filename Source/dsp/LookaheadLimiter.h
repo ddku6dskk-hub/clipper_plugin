@@ -55,6 +55,12 @@ public:
 
         envGR    = SampleType (1);
         smoothGR = SampleType (1);
+
+        // threshold 平滑化: 5ms 線形ランプ (ジッパー除去に十分 & オートメーション追従を
+        // 損なわない)。prepare 直後の初回 setThreshold は即時反映 (threshInit)。
+        threshRampLen = std::max (1, (int) std::llround (0.005 * sampleRate));
+        threshRampRemaining = 0;
+        threshInit = false;
     }
 
     void reset()
@@ -67,9 +73,30 @@ public:
         writePos = 0;
         envGR    = SampleType (1);
         smoothGR = SampleType (1);
+        threshold = targetThreshold;   // 進行中ランプは破棄して目標値へスナップ
+        threshRampRemaining = 0;
     }
 
-    void setThreshold (SampleType t) noexcept { threshold = t; }
+    /**
+     * threshold 設定。prepare 後の初回は即時反映、以降は 5ms 線形ランプで遷移する
+     * (input/output gain の applyGainRamp と同じ思想のジッパーノイズ対策。従来は
+     * ブロック単位のステップ変化で、threshold の高速オートメーション時に段差が出ていた)。
+     */
+    void setThreshold (SampleType t) noexcept
+    {
+        if (! threshInit)
+        {
+            threshold = targetThreshold = t;
+            threshRampRemaining = 0;
+            threshInit = true;
+            return;
+        }
+        if (t == targetThreshold)
+            return;
+        targetThreshold = t;
+        threshRampStep = (t - threshold) / (SampleType) threshRampLen;
+        threshRampRemaining = threshRampLen;
+    }
 
     int getLatencySamples() const noexcept { return L; }
 
@@ -80,6 +107,14 @@ public:
 
     SampleType process (SampleType x) noexcept
     {
+        // --- threshold ramp (setThreshold 参照) ---
+        if (threshRampRemaining > 0)
+        {
+            threshold += threshRampStep;
+            if (--threshRampRemaining == 0)
+                threshold = targetThreshold;   // 浮動小数の累積誤差なく厳密到達
+        }
+
         const SampleType ax = std::abs (x);
 
         // --- sliding-max (monotone decreasing deque) ---
@@ -151,6 +186,11 @@ private:
     std::int64_t sampleIndex = 0;
 
     SampleType threshold = SampleType (1);
+    SampleType targetThreshold = SampleType (1);
+    SampleType threshRampStep = SampleType (0);
+    int  threshRampLen = 1;
+    int  threshRampRemaining = 0;
+    bool threshInit = false;   // prepare 後、初回 setThreshold は即時反映するためのフラグ
     SampleType envGR = SampleType (1);
     SampleType smoothGR = SampleType (1);
     SampleType releaseCoeff = SampleType (0);
