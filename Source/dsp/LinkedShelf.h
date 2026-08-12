@@ -14,6 +14,14 @@ namespace kyohei::dsp
  * post で元のレベルに戻されるため「帯域別クリップ」が実現される。
  *
  * Order を指定すると、gain を order 分だけ分割して直列カスケード。
+ *
+ * ── 内部演算は必ず double ────────────────────────────────────────
+ * IIR の係数・状態を float で持つと、16x OS (768kHz) に対して corner が低い LF モード
+ * (2604Hz → 正規化 0.0034) で直接形バイキャッドの量子化誤差が効き、pre→post の
+ * 打ち消しが完全に閉じなくなる。実測: float は閾値以下の素通し区間に **-81 dBFS**
+ * (shelf -12dB / 入力 -6dBFS / 768kHz) の残差を残す。double 化するとこれが
+ * -150 dBFS (= 入出力境界の float 1 ULP) まで落ち、実質 bit-exact な打ち消しになる。
+ * 対外インターフェース (SampleType) は float のまま、境界だけで変換する。
  */
 template <typename SampleType>
 class LinkedShelf
@@ -50,7 +58,7 @@ public:
         sinW = std::sin (omega);
         oneOverSMinus1 = 1.0 / (double) slope - 1.0;
 
-        const auto gPer = gainDb / (SampleType) order;
+        const double gPer = (double) gainDb / (double) order;
         for (int i = 0; i < order; ++i)
         {
             auto preCoeff  = designShelf (k, +gPer, cornerHz, slope);
@@ -68,7 +76,7 @@ public:
     void setGainDbFast (SampleType gainDb) noexcept
     {
         currentGainDb = gainDb;
-        const auto gPer = gainDb / (SampleType) order;
+        const double gPer = (double) gainDb / (double) order;
         for (int i = 0; i < order; ++i)
         {
             writeShelfCoeffsInPlace (pre [(size_t) i].coefficients->getRawCoefficients(), +gPer);
@@ -76,36 +84,39 @@ public:
         }
     }
 
-    /** pre-stage を適用（原音 → shelf boost/cut） */
+    /** pre-stage を適用（原音 → shelf boost/cut）。内部は double、境界のみ SampleType。 */
     SampleType processPre (SampleType x) noexcept
     {
-        for (auto& f : pre) x = f.processSample (x);
-        return x;
+        double v = (double) x;
+        for (auto& f : pre) v = f.processSample (v);
+        return (SampleType) v;
     }
 
-    /** post-stage を適用（clip 後 → 逆 shelf） */
+    /** post-stage を適用（clip 後 → 逆 shelf）。内部は double、境界のみ SampleType。 */
     SampleType processPost (SampleType x) noexcept
     {
-        for (auto& f : post) x = f.processSample (x);
-        return x;
+        double v = (double) x;
+        for (auto& f : post) v = f.processSample (v);
+        return (SampleType) v;
     }
 
 private:
-    using Coeff = juce::dsp::IIR::Coefficients<SampleType>;
+    // 係数・状態は常に double (SampleType には追従させない)。理由はクラス冒頭コメント参照。
+    using Coeff = juce::dsp::IIR::Coefficients<double>;
 
     juce::ReferenceCountedObjectPtr<Coeff>
-    designShelf (Kind k, SampleType gainDb, SampleType cornerHz, SampleType slope) const
+    designShelf (Kind k, double gainDb, double cornerHz, double slope) const
     {
         // RBJ cookbook shelving filter
-        const auto A = std::pow (SampleType (10), gainDb / (SampleType) 40);
-        const auto omega = juce::MathConstants<SampleType>::twoPi * cornerHz / (SampleType) sampleRate;
+        const auto A = std::pow (10.0, gainDb / 40.0);
+        const auto omega = juce::MathConstants<double>::twoPi * cornerHz / sampleRate;
         const auto cosLocal = std::cos (omega);
         const auto sinLocal = std::sin (omega);
-        const auto val  = (A + (SampleType) 1 / A) * ((SampleType) 1 / slope - (SampleType) 1) + (SampleType) 2;
-        const auto alpha = sinLocal * (SampleType) 0.5 * std::sqrt (juce::jmax ((SampleType) 0, val));
+        const auto val  = (A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0;
+        const auto alpha = sinLocal * 0.5 * std::sqrt (juce::jmax (0.0, val));
         const auto sqA = std::sqrt (A);
 
-        SampleType b0, b1, b2, a0, a1, a2;
+        double b0, b1, b2, a0, a1, a2;
         if (k == Kind::HighShelf)
         {
             b0 =  A * ((A + 1) + (A - 1) * cosLocal + 2 * sqA * alpha);
@@ -125,16 +136,16 @@ private:
             a2 =       (A + 1) + (A - 1) * cosLocal - 2 * sqA * alpha;
         }
 
-        return new Coeff (b0 / a0, b1 / a0, b2 / a0, (SampleType) 1, a1 / a0, a2 / a0);
+        return new Coeff (b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0);
     }
 
     /**
      * in-place RBJ shelf 係数計算。cached cosW/sinW/oneOverSMinus1 を使用。
      * dst は少なくとも 5 要素を持つ配列 (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0)。
      */
-    void writeShelfCoeffsInPlace (SampleType* dst, SampleType gainDb) noexcept
+    void writeShelfCoeffsInPlace (double* dst, double gainDb) noexcept
     {
-        const double A = std::pow (10.0, (double) gainDb / 40.0);
+        const double A = std::pow (10.0, gainDb / 40.0);
         const double val = (A + 1.0 / A) * oneOverSMinus1 + 2.0;
         const double alpha = sinW * 0.5 * std::sqrt (std::max (0.0, val));
         const double sqA = std::sqrt (A);
@@ -160,11 +171,11 @@ private:
         }
 
         const double inv = 1.0 / a0;
-        dst[0] = (SampleType) (b0 * inv);
-        dst[1] = (SampleType) (b1 * inv);
-        dst[2] = (SampleType) (b2 * inv);
-        dst[3] = (SampleType) (a1 * inv);
-        dst[4] = (SampleType) (a2 * inv);
+        dst[0] = b0 * inv;
+        dst[1] = b1 * inv;
+        dst[2] = b2 * inv;
+        dst[3] = a1 * inv;
+        dst[4] = a2 * inv;
     }
 
     Kind kind = Kind::LowShelf;
@@ -172,7 +183,7 @@ private:
     double sampleRate = 48000.0;
     // RT-safe な in-place 更新用にキャッシュした geometry
     double cosW = 0.0, sinW = 0.0, oneOverSMinus1 = 0.0;
-    SampleType currentGainDb = 0, currentCornerHz = 1000, currentSlope = 1;
-    std::vector<juce::dsp::IIR::Filter<SampleType>> pre, post;
+    double currentGainDb = 0, currentCornerHz = 1000, currentSlope = 1;
+    std::vector<juce::dsp::IIR::Filter<double>> pre, post;
 };
 } // namespace kyohei::dsp

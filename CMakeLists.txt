@@ -6,7 +6,7 @@ set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "build universal binary 
 
 # LANGUAGES に C を含める: AAX SDK ラッパーが C ソースを含むため、AAX 自動検出時に
 # C 言語が未有効だと generate 段で CMAKE_C_COMPILE_OBJECT エラーになる (CMake 4.x)
-project(KyoheiClipper VERSION 1.0.9 LANGUAGES C CXX)
+project(KyoheiClipper VERSION 1.0.10 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

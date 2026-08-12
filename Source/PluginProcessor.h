@@ -36,7 +36,13 @@ public:
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    // OS 群遅延 + look-ahead ぶんの音声を内部に保持するため、入力停止後もその分の
+    // 出力が続く。0 を返すとオフラインバウンス時に末尾を切り落とすホストがあるので、
+    // 実レイテンシを tail として報告する (K Slew Limiter / K Peak Controller と同基準)。
+    double getTailLengthSeconds() const override
+    {
+        return preparedSampleRate > 0.0 ? (double) getLatencySamples() / preparedSampleRate : 0.0;
+    }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -120,6 +126,7 @@ private:
     // prepareToPlay で告知された最大ブロック長。dryScratch/oversampler の確保量はこれ前提
     // なので、超過ブロックを渡す契約違反ホストでは processBlock がこのサイズに分割処理する。
     int preparedBlockSize = 0;
+    double preparedSampleRate = 0.0;   // getTailLengthSeconds() でサンプル→秒に直すのに使う
 
     // input/output gain の前ブロック適用値。applyGainRamp で今ブロック値へ線形補間し、
     // オートメーション/ノブ操作時のブロック境界段差 (ジッパーノイズ) を防ぐ。

@@ -93,6 +93,7 @@ KyoheiClipperProcessor::createLayout()
 
 void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    preparedSampleRate = sampleRate;
 #if KYOHEI_SLAMMER
     // Slammer: 4x OS、トランジェント重視、lookahead なし
     const int osFactor = 2; // 2^2 = 4x
