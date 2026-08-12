@@ -29,6 +29,14 @@ KyoheiClipperProcessor::KyoheiClipperProcessor()
     pInputGain  = apvts.getRawParameterValue ("inputGain");
     pOutputGain = apvts.getRawParameterValue ("outputGain");
     pBypass     = apvts.getRawParameterValue ("bypass");
+
+    // std::atomic<float> は既定構築では不定値なので、リングは必ず明示初期化する
+    for (auto& chArr : visInDb)
+        for (auto& f : chArr)
+            f.store (-100.0f, std::memory_order_relaxed);
+    for (auto& chArr : visGrDb)
+        for (auto& f : chArr)
+            f.store (0.0f, std::memory_order_relaxed);
 }
 
 juce::AudioProcessorParameter* KyoheiClipperProcessor::getBypassParameter() const
@@ -159,7 +167,24 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     dryScratch.setSize (2, samplesPerBlock, false, false, true);
     dryScratch.clear();
+    gainScratch.setSize (2, samplesPerBlock, false, false, true);
+    gainScratch.clear();
+    visInScratch.setSize (2, samplesPerBlock, false, false, true);
+    visInScratch.clear();
     preparedBlockSize = samplesPerBlock;
+
+    // ビジュアライザのフレーム長 (10ms)
+    visFrameLen = juce::jmax (1, (int) std::llround (0.010 * sampleRate));
+    visFrameCount = 0;
+    visFramePeak.fill (0.0f);
+    visFrameMinGain.fill (1.0f);
+    for (auto& chArr : visInDb)
+        for (auto& f : chArr)
+            f.store (-100.0f, std::memory_order_relaxed);
+    for (auto& chArr : visGrDb)
+        for (auto& f : chArr)
+            f.store (0.0f, std::memory_order_relaxed);
+    visWritePos.store (0, std::memory_order_release);
 
     bypassMix.reset (sampleRate, 0.015); // 15ms ランプ
     bypassMix.setCurrentAndTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
@@ -171,6 +196,7 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     grPeakDb.store    (0.0f,    std::memory_order_relaxed);
     inputPeakDb.store (-100.0f, std::memory_order_relaxed);
     outputPeakDb.store (-100.0f, std::memory_order_relaxed);
+    resetSessionPeaks();
 }
 
 bool KyoheiClipperProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -272,7 +298,19 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     if (! std::isfinite (peakIn))
         peakIn = 0.0f;
 
-    atomicPeakMax (inputPeakDb, juce::Decibels::gainToDecibels (peakIn, -100.0f));
+    const float peakInDb = juce::Decibels::gainToDecibels (peakIn, -100.0f);
+    atomicPeakMax (inputPeakDb, peakInDb);
+    atomicPeakMax (sessionPeakDb, peakInDb);
+
+    // ビジュアライザの入力レーン用に |入力| を控えておく (OS 後の buffer は処理済み信号に
+    // 変わってしまうため、input gain 適用直後のここでしか取れない)
+    for (int c = 0; c < juce::jmin (numChannels, 2); ++c)
+    {
+        const auto* src = buffer.getReadPointer (c);
+        auto* dst = visInScratch.getWritePointer (c);
+        for (int i = 0; i < numSamples; ++i)
+            dst[i] = std::abs (src[i]);
+    }
 
     // oversample up
     juce::dsp::AudioBlock<float> block (buffer);
@@ -287,6 +325,12 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     // osPeak: 処理後の OS ドメインピーク。ダウンサンプル前の帯域制限済み波形の最大値なので、
     // ベースレート sample peak が取りこぼす inter-sample peak を含む True-Peak 推定になる
     // (クリップ LED 判定用。ダウンサンプル FIR のリンギング超過 +0.002dB 実測のみ漏れる)。
+    // ビジュアライザ用に、同じゲイン値を base サンプル単位へも畳む。OS の R サンプルを
+    // 1 base サンプルに min で集約する (GR は最小ゲイン = 最大リダクションで代表させる)。
+    // blockMinGain の計算はそのまま残してあるので、既存の GR メーター/CLIP LED の
+    // 挙動は一切変わらない (時間分解能の高い経路を「足した」だけ)。
+    const int osRatio = juce::jmax (1, osNumSamples / juce::jmax (1, numSamples));
+
     float blockMinGain = 1.0f;
     float osPeak = 0.0f;
     for (int c = 0; c < numChannels; ++c)
@@ -294,12 +338,32 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
         auto* data = osBlock.getChannelPointer ((size_t) c);
         const size_t chIdx = (size_t) juce::jmin (c, 1);
         auto& chain   = chains  [chIdx];
+
+        auto* gainOut = gainScratch.getWritePointer ((int) chIdx);
+        float groupMin = 1.0f;      // 今の base サンプルへ畳み込み中の最小ゲイン
+        int baseIdx = 0, groupCount = 0;
+
+        // 除算を内側ループに入れないためカウンタで境界を判定する (16x のホットループ)
+        const auto accumulate = [&] (float gain) noexcept
+        {
+            blockMinGain = juce::jmin (blockMinGain, gain);
+            groupMin     = juce::jmin (groupMin, gain);
+            if (++groupCount >= osRatio)
+            {
+                if (baseIdx < numSamples)
+                    gainOut[baseIdx] = groupMin;
+                ++baseIdx;
+                groupCount = 0;
+                groupMin = 1.0f;
+            }
+        };
+
 #if KYOHEI_SLAMMER
         // Slammer: ドラム用途向けに shaper のみ（lookahead なし）でトランジェント保持
         for (int i = 0; i < osNumSamples; ++i)
         {
             data[i] = chain.process (data[i]);
-            blockMinGain = juce::jmin (blockMinGain, chain.getLastShaperGain());
+            accumulate (chain.getLastShaperGain());
             osPeak = juce::jmax (osPeak, std::abs (data[i]));
         }
 #else
@@ -311,11 +375,14 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
             const float limited = limiter.process (data[i]);
             data[i] = chain.process (limited);
             // 総 GR = limiter 適用ゲイン × shaper 適用ゲイン (どちらも出力サンプルに整合済み)
-            blockMinGain = juce::jmin (blockMinGain,
-                                       limiter.getLastGain() * chain.getLastShaperGain());
+            accumulate (limiter.getLastGain() * chain.getLastShaperGain());
             osPeak = juce::jmax (osPeak, std::abs (data[i]));
         }
 #endif
+
+        // 端数 (osNumSamples が numSamples の整数倍でない契約違反ケース) の穴埋め
+        for (int n = baseIdx; n < numSamples; ++n)
+            gainOut[n] = groupMin;
     }
 
     // oversample down
@@ -328,6 +395,46 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 
     if (! std::isfinite (grDb))
         grDb = 0.0f;
+
+    // --- ビジュアライザ: 10ms フレームに畳んでリングへ (K Peak Controller と同設計) ---
+    // 入力レーン = input gain 適用後の |入力| (visInScratch)、GR レーン = 実際に適用した
+    // ゲイン (gainScratch)。両方とも同じ base サンプル index なので時間が揃っている。
+    if (numChannels > 0)
+    {
+        const int lanes = juce::jlimit (1, 2, numChannels);
+        visNumChannels.store (lanes, std::memory_order_relaxed);
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            for (int c = 0; c < lanes; ++c)
+            {
+                visFramePeak[(size_t) c] =
+                    juce::jmax (visFramePeak[(size_t) c], visInScratch.getReadPointer (c)[i]);
+                visFrameMinGain[(size_t) c] =
+                    juce::jmin (visFrameMinGain[(size_t) c], gainScratch.getReadPointer (c)[i]);
+            }
+
+            if (++visFrameCount >= visFrameLen)
+            {
+                const int w = visWritePos.load (std::memory_order_relaxed);
+                for (int c = 0; c < lanes; ++c)
+                {
+                    visInDb[(size_t) c][(size_t) w].store (
+                        juce::Decibels::gainToDecibels (visFramePeak[(size_t) c], -100.0f),
+                        std::memory_order_relaxed);
+                    const float mg = visFrameMinGain[(size_t) c];
+                    const float fGr = (mg > 0.0f && mg < 1.0f) ? -20.0f * std::log10 (mg) : 0.0f;
+                    visGrDb[(size_t) c][(size_t) w].store (std::isfinite (fGr) ? fGr : 0.0f,
+                                                           std::memory_order_relaxed);
+                }
+                // release: UI (acquire 読み) が新 writePos を見た時点で当該フレーム値の可視を保証
+                visWritePos.store ((w + 1) % kVisFrames, std::memory_order_release);
+                visFrameCount = 0;
+                visFramePeak.fill (0.0f);
+                visFrameMinGain.fill (1.0f);
+            }
+        }
+    }
 
     // output gain — input 側と同様にランプ適用
     const float outGainStart = lastOutGain;
@@ -356,6 +463,7 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 
     // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)
     atomicPeakMax (grPeakDb, grDb * (1.0f - mixEnd));
+    atomicPeakMax (sessionGrDb, grDb * (1.0f - mixEnd));   // 情報行 "Max GR" (実測の最大)
 
     // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)。
     // ベースレート sample peak に加え、OS ドメイン処理後ピーク × 出力ゲイン × wet 比率の
@@ -409,6 +517,7 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
 
     const float db = juce::Decibels::gainToDecibels (peakIn, -100.0f);
     atomicPeakMax (inputPeakDb, db);
+    atomicPeakMax (sessionPeakDb, db);                    // 情報行 "Peak" は素通し中も追う
     grPeakDb.store (0.0f, std::memory_order_relaxed);     // bypass 中は GR なし
     atomicPeakMax (outputPeakDb, db);
 

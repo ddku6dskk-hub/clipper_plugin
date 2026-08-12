@@ -3,6 +3,16 @@
 
 namespace
 {
+    // ビジュアライザの縦軸レンジ (K Peak Controller と同じ)
+    constexpr float kVisTopDb    = 0.0f;
+    constexpr float kVisBottomDb = -36.0f;
+
+    float dbToY (float db, juce::Rectangle<int> b)
+    {
+        const float t = juce::jlimit (0.0f, 1.0f, (kVisTopDb - db) / (kVisTopDb - kVisBottomDb));
+        return (float) b.getY() + t * (float) b.getHeight();
+    }
+
     void configureVertical (juce::Slider& s)
     {
         s.setSliderStyle (juce::Slider::LinearVertical);
@@ -18,7 +28,9 @@ namespace
 KyoheiClipperEditor::KyoheiClipperEditor (KyoheiClipperProcessor& p)
     : juce::AudioProcessorEditor (p), proc (p)
 {
-    setSize (700, 340);
+    // 左にビジュアライザを追加したぶん横に拡張。スライダー間隔を詰めた分だけ
+    // 全体幅も縮めてある (ビジュアライザの実寸は変えない)
+    setSize (970, 400);
 
     for (auto* s : { &thresholdSlider, &kneeSlider, &inputGainSlider, &outputGainSlider })
     {
@@ -65,17 +77,31 @@ void KyoheiClipperEditor::paint (juce::Graphics& g)
 #endif
     g.drawText (title, getLocalBounds().removeFromTop (28), juce::Justification::centred);
 
+    drawVisualizer (g, visBounds);
     drawGrMeter (g, grMeterBounds);
+
+    g.setColour (juce::Colour::fromRGB (170, 170, 185));
+    g.setFont (juce::Font (juce::FontOptions (11.0f)));
+    g.drawText (infoText, infoBounds, juce::Justification::centredLeft);
 }
 
 void KyoheiClipperEditor::resized()
 {
     auto area = getLocalBounds().reduced (10);
     area.removeFromTop (30); // title
-    const int cellW = 130, labelH = 20, sliderH = 210;
+    // スライダー列は 108px 間隔 (旧 130px から詰めた)。GR 列だけは下の数値表示
+    // "-100.0 dBFS / 0.0 dB" が折り返さないよう 130px を維持する。
+    const int cellW = 108, grCellW = 130, labelH = 20, sliderH = 210;
+
+    // 右パネル = 従来のコントロール一式。残った左側をビジュアライザ + 情報行に使う。
+    auto right = area.removeFromRight (cellW * 4 + grCellW);
+    area.removeFromRight (10);
+
+    infoBounds = area.removeFromBottom (20);
+    visBounds  = area.reduced (0, 4);
 
     // 4 列セル + GR メーター
-    auto row = area.removeFromTop (labelH + sliderH + 10);
+    auto row = right.removeFromTop (labelH + sliderH + 10);
     auto placeCell = [&] (juce::Label& label, juce::Slider& slider)
     {
         auto cell = row.removeFromLeft (cellW);
@@ -90,14 +116,14 @@ void KyoheiClipperEditor::resized()
     // GR メーター: ラベル + CLIP LED 行 + 縦バー (paint で描画)
     // GR ラベル下に CLIP LED 行 18px を確保 → bar はその分縮める
     constexpr int clipRowH = 18;
-    auto grCell = row.removeFromLeft (cellW);
+    auto grCell = row.removeFromLeft (grCellW);
     grLabel.setBounds (grCell.removeFromTop (labelH));
     grCell.removeFromTop (clipRowH);
     grMeterBounds = grCell.withSizeKeepingCentre (50, sliderH - clipRowH);
 
-    area.removeFromTop (10);
-    modeLabel.setBounds (area.removeFromTop (labelH));
-    auto modeRow = area.removeFromTop (30);
+    right.removeFromTop (10);
+    modeLabel.setBounds (right.removeFromTop (labelH));
+    auto modeRow = right.removeFromTop (30);
     modeBox.setBounds (modeRow.withSizeKeepingCentre (200, 28));
 }
 
@@ -150,12 +176,126 @@ void KyoheiClipperEditor::timerCallback()
     else if (clipLedFramesLeft > 0)
         --clipLedFramesLeft;
 
-    // repaint 範囲: 横は数値テキスト (130px) 用に拡張、上は CLIP LED 用に広め
+    // 情報行: セッション最大の入力ピークと GR (どちらも実測値)。
+    // クリックでリセットできる (K Peak Controller / K Phase Rotator と同じ操作感)。
+    {
+        const float peak = proc.sessionPeakDb.load (std::memory_order_relaxed);
+        const float maxGr = proc.sessionGrDb.load (std::memory_order_relaxed);
+        if (peak > -99.0f)
+            infoText = "Peak: " + juce::String (peak, 1) + " dBFS  |  Max GR: "
+                     + juce::String (juce::jlimit (0.0f, 99.9f, maxGr), 1) + " dB";
+        else
+            infoText = "feed audio...";
+    }
+
+    // repaint 範囲: GR メーター周り (横は数値テキスト 130px、上は CLIP LED 用) +
+    // ビジュアライザ + 情報行
     const int meterCx = grMeterBounds.getCentreX();
     repaint (meterCx - 70,
              grMeterBounds.getY() - 28,
              140,
              grMeterBounds.getHeight() + 52);
+    repaint (visBounds.getUnion (infoBounds).expanded (8, 8));
+}
+
+/** 情報行 (左下の Peak / Max GR) をクリックするとホールドをリセットする。
+    ビジュアライザの履歴は消さないので、スクロール表示を見ながら数値だけ測り直せる。 */
+void KyoheiClipperEditor::mouseDown (const juce::MouseEvent& e)
+{
+    if (infoBounds.contains (e.getPosition()))
+    {
+        proc.resetSessionPeaks();
+        repaint (infoBounds.expanded (8, 8));
+    }
+}
+
+void KyoheiClipperEditor::mouseMove (const juce::MouseEvent& e)
+{
+    // クリックできることが分かるようにカーソルで示す (常時の説明文は情報量過多になるため)
+    setMouseCursor (infoBounds.contains (e.getPosition())
+                        ? juce::MouseCursor::PointingHandCursor
+                        : juce::MouseCursor::NormalCursor);
+}
+
+/** 直近約10秒の { 入力ピーク, GR } を L/R 独立のレーンでスクロール表示する。
+    シアン = 出力レベル、琥珀 = クリッパー/リミッターが削った分 (帽子として上に乗る)。 */
+void KyoheiClipperEditor::drawVisualizer (juce::Graphics& g, juce::Rectangle<int> bounds)
+{
+    const int lanes = juce::jlimit (1, 2, proc.visNumChannels.load (std::memory_order_relaxed));
+    const int gap = lanes == 2 ? 4 : 0;
+    const int laneH = (bounds.getHeight() - gap) / lanes;
+
+    for (int lane = 0; lane < lanes; ++lane)
+    {
+        auto lb = juce::Rectangle<int> (bounds.getX(), bounds.getY() + lane * (laneH + gap),
+                                        bounds.getWidth(), laneH);
+
+        g.setColour (juce::Colour::fromRGB (16, 16, 20));
+        g.fillRect (lb);
+
+        // dB グリッド
+        g.setFont (juce::Font (juce::FontOptions (8.0f)));
+        for (float db : { 0.0f, -6.0f, -12.0f, -18.0f, -24.0f, -30.0f })
+        {
+            const float y = dbToY (db, lb);
+            g.setColour (juce::Colour::fromRGB (40, 40, 48));
+            g.drawHorizontalLine ((int) y, (float) lb.getX(), (float) lb.getRight());
+            g.setColour (juce::Colour::fromRGB (90, 90, 100));
+            g.drawText (juce::String ((int) db), lb.getX() + 2, (int) y - 9, 24, 8,
+                        juce::Justification::left);
+        }
+
+        // フレーム描画: 古→新を左→右へ
+        const int W = KyoheiClipperProcessor::kVisFrames;
+        const int writePos = proc.visWritePos.load (std::memory_order_acquire);
+        const float step = (float) lb.getWidth() / (float) W;
+
+        for (int i = 0; i < W; ++i)
+        {
+            const int idx = (writePos + i) % W;   // i=0 が最古
+            const float inDb = proc.visInDb[(size_t) lane][(size_t) idx]
+                                   .load (std::memory_order_relaxed);
+            if (inDb <= kVisBottomDb)
+                continue;
+            const float grDb = proc.visGrDb[(size_t) lane][(size_t) idx]
+                                   .load (std::memory_order_relaxed);
+            const float outDb = inDb - grDb;
+
+            const float x = (float) lb.getX() + step * (float) i;
+            const float w = juce::jmax (step, 1.0f);
+
+            const float yIn  = dbToY (inDb, lb);
+            const float yOut = dbToY (outDb, lb);
+            const float yBot = (float) lb.getBottom();
+
+            if (grDb > 0.05f)
+            {
+                g.setColour (juce::Colour::fromRGB (150, 110, 60));    // 削られた分 (琥珀)
+                g.fillRect (x, yIn, w, yOut - yIn);
+            }
+            g.setColour (juce::Colour::fromRGB (70, 150, 170));        // 出力 (シアン)
+            g.fillRect (x, yOut, w, yBot - yOut);
+        }
+
+        // threshold ライン (入力レーンは input gain 適用後なので、閾値と直接見比べられる)
+        if (auto* pThr = proc.apvts.getRawParameterValue ("threshold"))
+        {
+            const float y = dbToY (pThr->load(), lb);
+            g.setColour (juce::Colour::fromRGB (235, 200, 90));
+            g.drawHorizontalLine ((int) y, (float) lb.getX(), (float) lb.getRight());
+        }
+
+        if (lanes == 2)
+        {
+            g.setColour (juce::Colour::fromRGB (150, 150, 165));
+            g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
+            g.drawText (lane == 0 ? "L" : "R", lb.getRight() - 36, lb.getY() + 3, 32, 12,
+                        juce::Justification::centredRight);
+        }
+
+        g.setColour (juce::Colour::fromRGB (60, 60, 70));
+        g.drawRect (lb, 1);
+    }
 }
 
 void KyoheiClipperEditor::drawGrMeter (juce::Graphics& g, juce::Rectangle<int> bounds)

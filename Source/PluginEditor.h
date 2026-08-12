@@ -10,10 +10,13 @@ public:
     explicit KyoheiClipperEditor (KyoheiClipperProcessor&);
     void paint (juce::Graphics&) override;
     void resized() override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
 
 private:
     void timerCallback() override;
     void drawGrMeter (juce::Graphics&, juce::Rectangle<int> bounds);
+    void drawVisualizer (juce::Graphics&, juce::Rectangle<int> bounds);
 
     using APVTS = juce::AudioProcessorValueTreeState;
     using SliderAttach = APVTS::SliderAttachment;
@@ -41,7 +44,8 @@ private:
     // クリップ LED 状態: 出力 peak が 0 dBFS を超えた瞬間に点灯、1秒ホールド
     int   clipLedFramesLeft     = 0;
 
-    juce::Rectangle<int> grMeterBounds;
+    juce::Rectangle<int> grMeterBounds, visBounds, infoBounds;
+    juce::String infoText;   // "Peak: x dBFS | Max GR: y dB" (Timer で更新)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KyoheiClipperEditor)
 };

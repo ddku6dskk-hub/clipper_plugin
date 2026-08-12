@@ -2,6 +2,7 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include <array>
 #include "dsp/ClipperChain.h"
 #include "dsp/LookaheadLimiter.h"
 
@@ -61,6 +62,31 @@ public:
     // inter-sample peak の取りこぼし防止)。クリップ LED 判定 (0 dBFS 超え) に使う
     std::atomic<float> outputPeakDb { -100.0f };
 
+    // ---- 情報行 (Peak / Max GR)。prepareToPlay と情報行クリックでクリア ----
+    // Peak = input gain 適用後のセッション最大サンプルピーク [dBFS]、
+    // Max GR = セッション最大 GR [dB] (どちらも実測値。予測値ではない)。
+    std::atomic<float> sessionPeakDb { -100.0f };
+    std::atomic<float> sessionGrDb   { 0.0f };
+
+    /** 情報行のホールドをクリアする (UI の情報行クリック)。
+        message thread から安全: atomic ストアのみ。 */
+    void resetSessionPeaks() noexcept
+    {
+        sessionPeakDb.store (-100.0f, std::memory_order_relaxed);
+        sessionGrDb.store   (0.0f,    std::memory_order_relaxed);
+    }
+
+    // ---- ビジュアライザ (スクロール表示、L/R 独立。K Peak Controller と同設計) ----
+    // 10ms フレームごとにチャンネル別の { 入力ピーク dBFS, GR dB } をリングに書く。
+    // どちらも「input gain 適用後の入力タイムライン」上の値で揃えてある。総レイテンシ
+    // (OS 群遅延 + 0.2ms look-ahead) は 1 フレーム = 10ms よりはるかに短いので、この
+    // 粒度では両者のズレは見えない。
+    static constexpr int kVisFrames = 1024;   // 約 10 秒
+    std::array<std::array<std::atomic<float>, kVisFrames>, 2> visInDb;
+    std::array<std::array<std::atomic<float>, kVisFrames>, 2> visGrDb;
+    std::atomic<int> visWritePos { 0 };       // release で公開 (UI は acquire で読む)
+    std::atomic<int> visNumChannels { 2 };    // モノトラック時は 1 レーン表示
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
@@ -76,6 +102,16 @@ private:
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> dryDelayLine;
     juce::SmoothedValue<float> bypassMix;   // 0 = active, 1 = bypassed (15ms ramp)
     juce::AudioBuffer<float> dryScratch;    // 遅延済み dry の一時保持 (wet 処理後に混ぜる)
+
+    // --- ビジュアライザ用スクラッチ (base レート、ch 別) ---
+    // gainScratch: OS ドメインで実際に適用したゲインを base サンプル単位に min で畳んだもの。
+    // visInScratch: input gain 適用直後の |入力| (OS 後の buffer は処理済み信号なので別に保持)。
+    juce::AudioBuffer<float> gainScratch;
+    juce::AudioBuffer<float> visInScratch;
+    int visFrameLen = 480;                  // 10ms 相当 (prepareToPlay で算出)
+    int visFrameCount = 0;
+    std::array<float, 2> visFramePeak { { 0.0f, 0.0f } };
+    std::array<float, 2> visFrameMinGain { { 1.0f, 1.0f } };
 
     // processBlock 1回分の実処理。numSamples <= preparedBlockSize が前提
     // (processBlock 側で分割保証済み)。

@@ -3,7 +3,7 @@
 Open-source JUCE-based audio plug-ins: a transparent mastering clipper (**K Clipper**)
 and a transient-preserving drum/bass clipper (**K Slammer**).
 
-Formats: **VST3 / AU / AAX / Standalone** (macOS only).
+Formats: **VST3 / AU / AAX** (macOS only).
 
 ---
 
@@ -28,6 +28,25 @@ and a GR meter (0–12 dB, 30 Hz refresh, peak hold 1 s).
 The meter shows latency-aligned input/output peaks plus an HA-style **CLIP**
 indicator that lights when the output exceeds 0 dBFS. The input readout turns
 red when the input reaches 0 dBFS.
+
+#### Analyser (scrolling visualiser)
+
+The left panel scrolls roughly the last 10 seconds in two independent lanes
+(L/R; a single lane on mono tracks), at a 10 ms frame resolution:
+
+- **cyan** – output level
+- **amber** – how much the limiter/shaper took off, drawn as a cap on top
+- **yellow line** – the current Threshold
+
+Levels are taken *after* the Input gain, so the peaks line up with the
+Threshold line directly. Per-frame gain reduction is measured inside the
+oversampled domain from the gain coefficients actually applied — the same
+source as the GR meter, just at a finer time resolution.
+
+Below it, an info line shows the session maxima: `Peak: x dBFS | Max GR: y dB`
+(both measured, not predicted). **Clicking the info line resets those two
+readouts** without clearing the scrolling history, so you can re-measure a
+section while still watching the graph.
 
 ---
 
