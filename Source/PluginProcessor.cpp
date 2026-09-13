@@ -168,6 +168,8 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     dryScratch.setSize (2, samplesPerBlock, false, false, true);
     dryScratch.clear();
+    mixScratch.setSize (1, samplesPerBlock, false, false, true);
+    mixScratch.clear();
     gainScratch.setSize (2, samplesPerBlock, false, false, true);
     gainScratch.clear();
     visInScratch.setSize (2, samplesPerBlock, false, false, true);
@@ -193,6 +195,11 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     // 再生開始時に古いゲインから不要なランプがかからないよう現在値で初期化
     lastInGain  = juce::Decibels::decibelsToGain (pInputGain  != nullptr ? pInputGain->load()  : 0.0f);
     lastOutGain = juce::Decibels::decibelsToGain (pOutputGain != nullptr ? pOutputGain->load() : 0.0f);
+
+    // 上で wet 経路も bypassMix も作り直したので、hard bypass からの復帰待ちも捨てる。
+    // 残すと prepare 後の再生が「dry 保持 → フェード」から始まり、新規インスタンスと食い違う。
+    wetNeedsRestart = false;
+    wetRestartHold  = 0;
 
     grPeakDb.store    (0.0f,    std::memory_order_relaxed);
     inputPeakDb.store (-100.0f, std::memory_order_relaxed);
@@ -238,13 +245,14 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     }
 }
 
-void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
+// Mode / Threshold / Knee を chain と limiter へ反映する。
+// processChunk の冒頭と restartWetChain から呼ぶ。hard bypass 中は wet を回さないので、
+// その間の設定変更は復帰時にここを通して入れる。
+void KyoheiClipperProcessor::applyChainParams() noexcept
 {
     const auto mode = static_cast<kyohei::dsp::ClipperChain<float>::Mode> ((int) pMode->load());
     const float threshDb = pThreshold->load();
     const float kneeDb   = pKnee->load();
-    const float inGainLin  = juce::Decibels::decibelsToGain (pInputGain->load());
-    const float outGainLin = juce::Decibels::decibelsToGain (pOutputGain->load());
 
     for (auto& ch : chains)
     {
@@ -257,6 +265,14 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     for (auto& lim : limiters)
         lim.setThreshold (threshLin);
 #endif
+}
+
+void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
+{
+    const float inGainLin  = juce::Decibels::decibelsToGain (pInputGain->load());
+    const float outGainLin = juce::Decibels::decibelsToGain (pOutputGain->load());
+
+    applyChainParams();
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
@@ -272,9 +288,27 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
                 d[i] = 0.0f;
     }
 
+    // --- hard bypass からの復帰 ---
+    // 作り直した直後の wet は空なので、レイテンシ分は dry のまま出し、そのあと
+    // 15ms かけて wet へ渡す。いきなり切り替えると、非ゼロの dry から空の wet へ
+    // 直結されてクリックになる。soft bypass のクロスフェード機構をそのまま使う。
+    // 保持の残りはサンプル単位で数え、チャンクの途中でもそこからフェードを始める
+    // (下の mix 曲線を作る箇所)。チャンク単位で減らすと、保持がブロック長に切り上がり
+    // 512 で 26ms、2048 で 58ms と復帰がブロック長しだいで伸びていた。
+    if (wetNeedsRestart)
+    {
+        restartWetChain();
+        bypassMix.setCurrentAndTargetValue (1.0f);      // いったん全 dry
+        wetRestartHold = getLatencySamples();           // wet が満ちるまで dry を保持
+        wetNeedsRestart = false;
+    }
+
+    const float bypassTarget = pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f;
+    if (wetRestartHold <= 0)
+        bypassMix.setTargetValue (bypassTarget);
+
     // --- soft bypass: 素入力(input gain 前)を dry として確保し、wet と同じ reportedLatency
-    //     だけ遅延させて時間整合する。bypass 状態に関わらず毎ブロック回してウォーム維持。 ---
-    bypassMix.setTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
+    //     だけ遅延させて時間整合する。hard bypass 中も processBlockBypassed が同じ遅延線を回す。 ---
     for (int c = 0; c < numChannels; ++c)
     {
         const auto* src = buffer.getReadPointer (c);
@@ -321,18 +355,17 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 
     // GR は「各段が実際に適用したゲイン係数」を OS ドメイン内で直接測る (= 大手と同方式)。
     // up/down サンプリングの FIR リンギングや位相回しはこのループの外側なので構造的に混入せず、
-    // 閾値以下の素通し区間では blockMinGain == 1 (= 0 dB) になる。
+    // 閾値以下の素通し区間では適用ゲイン == 1 (= 0 dB) になる。
     //
     // osPeak: 処理後の OS ドメインピーク。ダウンサンプル前の帯域制限済み波形の最大値なので、
     // ベースレート sample peak が取りこぼす inter-sample peak を含む True-Peak 推定になる
     // (クリップ LED 判定用。ダウンサンプル FIR のリンギング超過 +0.002dB 実測のみ漏れる)。
-    // ビジュアライザ用に、同じゲイン値を base サンプル単位へも畳む。OS の R サンプルを
+    // 適用ゲインは base サンプル単位へ畳んで gainScratch に置く。OS の R サンプルを
     // 1 base サンプルに min で集約する (GR は最小ゲイン = 最大リダクションで代表させる)。
-    // blockMinGain の計算はそのまま残してあるので、既存の GR メーター/CLIP LED の
-    // 挙動は一切変わらない (時間分解能の高い経路を「足した」だけ)。
+    // GR メーターとビジュアライザは、どちらもこの gainScratch に bypass の mix を
+    // サンプルごとに掛けた実効ゲインから出す (下の「実効ゲイン」参照)。
     const int osRatio = juce::jmax (1, osNumSamples / juce::jmax (1, numSamples));
 
-    float blockMinGain = 1.0f;
     float osPeak = 0.0f;
     for (int c = 0; c < numChannels; ++c)
     {
@@ -347,8 +380,7 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
         // 除算を内側ループに入れないためカウンタで境界を判定する (16x のホットループ)
         const auto accumulate = [&] (float gain) noexcept
         {
-            blockMinGain = juce::jmin (blockMinGain, gain);
-            groupMin     = juce::jmin (groupMin, gain);
+            groupMin = juce::jmin (groupMin, gain);
             if (++groupCount >= osRatio)
             {
                 if (baseIdx < numSamples)
@@ -389,17 +421,40 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     // oversample down
     oversampler->processSamplesDown (block);
 
-    // GR [dB] = 潰した量。blockMinGain ∈ (0,1] を dB 化 (素通し時は 0 dB)。
-    float grDb = 0.0f;
-    if (blockMinGain > 0.0f && blockMinGain < 1.0f)
-        grDb = -20.0f * std::log10 (blockMinGain);
-
-    if (! std::isfinite (grDb))
-        grDb = 0.0f;
+    // --- soft bypass の per-sample mix 係数を先に確定させる ---
+    // ビジュアライザの GR レーンは「実際に出力へ効いている減衰量」でなければならないので、
+    // フレーム蓄積より前に bypass 量を知っておく。完全 bypass 中に琥珀 (削られた分) が
+    // 出続けるのを防ぐ (GR メーターは既に bypass 補正済みで、表示同士が食い違っていた)。
+    auto* mixCurve = mixScratch.getWritePointer (0);
+    const float mixStart = bypassMix.getCurrentValue();          // ランプを進める前の値
+    const bool bypassMixing = bypassMix.isSmoothing() || mixStart > 0.0f;   // 復帰の保持中は mixStart == 1
+    if (bypassMixing)
+    {
+        int i = 0;
+        if (wetRestartHold > 0)
+        {
+            // hard bypass 復帰の dry 保持。残りを使い切ったサンプルからフェードを始める
+            const int held = juce::jmin (wetRestartHold, numSamples);
+            for (; i < held; ++i)
+                mixCurve[i] = 1.0f;
+            wetRestartHold -= held;
+            if (wetRestartHold == 0)
+                bypassMix.setTargetValue (bypassTarget);
+        }
+        for (; i < numSamples; ++i)
+            mixCurve[i] = bypassMix.getNextValue();
+    }
+    else
+    {
+        juce::FloatVectorOperations::clear (mixCurve, numSamples);
+    }
+    const float mixEnd = bypassMix.getCurrentValue();
 
     // --- ビジュアライザ: 10ms フレームに畳んでリングへ (K Peak Controller と同設計) ---
     // 入力レーン = input gain 適用後の |入力| (visInScratch)、GR レーン = 実際に適用した
     // ゲイン (gainScratch)。両方とも同じ base サンプル index なので時間が揃っている。
+    // blockMinEffGain: 同じ実効ゲインのブロック内最小。GR メーターはこれを使う。
+    float blockMinEffGain = 1.0f;
     if (numChannels > 0)
     {
         const int lanes = juce::jlimit (1, 2, numChannels);
@@ -407,12 +462,17 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 
         for (int i = 0; i < numSamples; ++i)
         {
+            // 実効ゲイン: 出力 = wet·(1−m) + dry·m = dry·(g·(1−m) + m)。
+            // bypass 中は g_eff = 1 になるので、削られていない波形が正しく描かれる。
+            const float m = mixCurve[i];
+            const float wet = 1.0f - m;
             for (int c = 0; c < lanes; ++c)
             {
+                const float effGain = gainScratch.getReadPointer (c)[i] * wet + m;
+                blockMinEffGain = juce::jmin (blockMinEffGain, effGain);
                 visFramePeak[(size_t) c] =
                     juce::jmax (visFramePeak[(size_t) c], visInScratch.getReadPointer (c)[i]);
-                visFrameMinGain[(size_t) c] =
-                    juce::jmin (visFrameMinGain[(size_t) c], gainScratch.getReadPointer (c)[i]);
+                visFrameMinGain[(size_t) c] = juce::jmin (visFrameMinGain[(size_t) c], effGain);
             }
 
             if (++visFrameCount >= visFrameLen)
@@ -445,13 +505,11 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     // --- soft bypass crossfade: wet(buffer) ↔ 遅延 dry(dryScratch) ---
     // frame ごとに bypassMix を1回進めて全ch共通に適用。time-align 済みなのでクリックレス。
     // active 継続中(mix=0 かつ非平滑)はループを省いて従来どおり wet を素通し。
-    const float mixStart = bypassMix.getCurrentValue();
-    float mixEnd = mixStart;
-    if (bypassMix.isSmoothing() || mixStart > 0.0f)
+    if (bypassMixing)
     {
         for (int i = 0; i < numSamples; ++i)
         {
-            const float m = bypassMix.getNextValue();
+            const float m = mixCurve[i];
             const float wetGain = 1.0f - m;
             for (int c = 0; c < numChannels; ++c)
             {
@@ -459,12 +517,18 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
                 w[i] = w[i] * wetGain + dryScratch.getReadPointer (c)[i] * m;
             }
         }
-        mixEnd = bypassMix.getCurrentValue();
     }
 
-    // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)
-    atomicPeakMax (grPeakDb, grDb * (1.0f - mixEnd));
-    atomicPeakMax (sessionGrDb, grDb * (1.0f - mixEnd));   // 情報行 "Max GR" (実測の最大)
+    // GR メーターは bypass 量に応じてフェード (全 bypass で 0 表示)。
+    // ビジュアライザと**同じサンプルごとの実効ゲイン** g_eff = g·(1−m) + m の最小から出す。
+    // 【重要】ずれる書き方が 2 つあった:
+    //  - dB 値に wet 比率を掛ける → 式が違う (g=0.1・m=0.5 で 5.19dB 対 10dB)
+    //  - ブロック最小ゲインにブロック末尾の mix を掛ける → 集計区間が違う
+    //    (フェード開始ブロックで 3.99dB 対 1.14dB。最大 GR の瞬間の mix ではないため)
+    const float grEffDb = (blockMinEffGain > 0.0f && blockMinEffGain < 1.0f)
+                              ? -20.0f * std::log10 (blockMinEffGain) : 0.0f;
+    atomicPeakMax (grPeakDb, grEffDb);
+    atomicPeakMax (sessionGrDb, grEffDb);   // 情報行 "Max GR" (実測の最大)
 
     // 出力 peak [dBFS] — クロスフェード後の最終信号レベル (クリップ LED 判定用)。
     // ベースレート sample peak に加え、OS ドメイン処理後ピーク × 出力ゲイン × wet 比率の
@@ -482,6 +546,37 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
     atomicPeakMax (outputPeakDb, juce::Decibels::gainToDecibels (peakFinal, -100.0f));
 }
 
+// hard bypass から戻ったときに wet 経路を作り直す。
+//
+// 【なぜウォームし続けないのか】bypass 中も毎ブロック wet を回すと、状態は途切れないが
+// **bypass が active の 0.89 倍のCPUを食い続ける** (実測: active 7.80% / bypass 6.97% /
+// 回さない場合 0.09%。1インスタンス・48kHz・512サンプル)。「重いプラグインを bypass して
+// CPU を浮かせる」運用が成立しなくなるので、回すのをやめて復帰時に作り直す。
+//
+// 【設定は reset の前と後の両方で入れる】limiter と chain で reset の性質が逆だから。
+//  - LookaheadLimiter::reset() は threshInit を残し、threshold を targetThreshold へ
+//    スナップする → reset の**前**に目標値が最新でないと、旧値へスナップする。
+//  - ClipperChain::reset() は threshInit/kneeInit を下ろすだけで、平滑化の現在値と
+//    進行中のランプは残す → reset の**後**に設定を入れ直さないと、復帰の最初のチャンクが
+//    旧 threshold/knee からランプする (2026-09-11 R1。旧コメントの「順序はどちらでも同じ」は
+//    chain については誤りだった)。後の呼び出しで初回フラグが立ち、最新値へ即スナップする。
+// 2 回目の applyChainParams() は limiter には何もしない (同値の setThreshold は早期 return)。
+void KyoheiClipperProcessor::restartWetChain() noexcept
+{
+    applyChainParams();
+
+    if (oversampler != nullptr)
+        oversampler->reset();
+    for (auto& ch : chains)
+        ch.reset();
+#if !KYOHEI_SLAMMER
+    for (auto& lim : limiters)
+        lim.reset();
+#endif
+
+    applyChainParams();
+}
+
 void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
                                                     juce::MidiBuffer&)
 {
@@ -495,24 +590,49 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     if (preparedBlockSize <= 0)
         return;
 
-    const int numChannels = buffer.getNumChannels();
-    const int numSamples  = buffer.getNumSamples();
+    const int numChannels  = buffer.getNumChannels();
+    const int totalSamples = buffer.getNumSamples();
+    if (numChannels <= 0 || totalSamples <= 0)
+        return;
 
     float peakIn = 0.0f;
-    for (int c = 0; c < numChannels; ++c)
+
+    // 確保済みサイズ以下に分割 (oversampler/dryScratch は preparedBlockSize 前提)
+    for (int offset = 0; offset < totalSamples; offset += preparedBlockSize)
     {
-        auto* d = buffer.getWritePointer (c);
-        const int dch = juce::jmin (c, 1);
-        for (int i = 0; i < numSamples; ++i)
+        const int len = juce::jmin (preparedBlockSize, totalSamples - offset);
+
+        for (int c = 0; c < numChannels; ++c)
         {
-            float v = d[i];
-            if (! std::isfinite (v))       // NaN/Inf は遅延線に入れない (processChunk と同基準)
-                v = 0.0f;
-            dryDelayLine.pushSample (dch, v);
-            d[i] = dryDelayLine.popSample (dch);  // latency 整合済みの素通し
-            peakIn = juce::jmax (peakIn, std::abs (d[i]));
+            auto* d = buffer.getWritePointer (c) + offset;
+            const int dch = juce::jmin (c, 1);
+            for (int i = 0; i < len; ++i)
+            {
+                float v = d[i];
+                if (! std::isfinite (v))       // NaN/Inf は遅延線に入れない (processChunk と同基準)
+                    v = 0.0f;
+                dryDelayLine.pushSample (dch, v);
+                d[i] = dryDelayLine.popSample (dch);  // latency 整合済みの素通し
+                peakIn = juce::jmax (peakIn, std::abs (d[i]));
+            }
         }
+
     }
+
+    // wet は回さない (CPU を食わないのが hard bypass の存在意義)。
+    // 代わりに「次に processBlock へ戻ったら作り直す」印を立てる。凍結したまま復帰すると
+    // oversampler/limiter/chain に残った **bypass 直前の音** がそのまま出る
+    // (実測: DC 0.1 を処理 → 無音を 20 ブロック bypass → 復帰1ブロック目で
+    //  無音入力なのに出力ピーク 0.0999)。
+    wetNeedsRestart = true;
+
+    // 書きかけのビジュアライザフレームは捨てる。残すと、復帰後に続きを足して公開したとき
+    // bypass 前の GR・入力レベルが混ざる (実測: 無音で復帰したのに 16dB の GR フレーム)。
+    // 完成済みのフレームと情報行のセッション最大は履歴なので残す (bypass 中はグラフが止まる仕様)。
+    visFrameCount = 0;
+    visFramePeak.fill (0.0f);
+    visFrameMinGain.fill (1.0f);
+
     if (! std::isfinite (peakIn))
         peakIn = 0.0f;
 
@@ -535,8 +655,15 @@ juce::AudioProcessorEditor* KyoheiClipperProcessor::createEditor()
 
 void KyoheiClipperProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    // apvts.state を直接書き出すと、パラメータ変更が ValueTree へ反映される前
+    // (APVTS 内部のフラッシュ待ち) の古い値が保存されることがある
+    // (実測: Threshold を -12dB にした直後の保存で Clipper は -6、Slammer は -3 が入る)。
+    // copyState() は保留中の変更を反映してからスナップショットを返すので取りこぼさない。
+    // 呼び出しスレッドはホスト依存 (JUCE ラッパーはホストの保存要求から直接呼ぶ)。
+    // copyState() も setStateInformation 側の replaceState() もロックを取るので、
+    // **audio thread からは呼ばないこと**。
     juce::MemoryOutputStream mos (destData, false);
-    apvts.state.writeToStream (mos);
+    apvts.copyState().writeToStream (mos);
 }
 
 void KyoheiClipperProcessor::setStateInformation (const void* data, int sizeInBytes)

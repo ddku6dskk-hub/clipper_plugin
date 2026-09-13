@@ -103,8 +103,9 @@ private:
 
     // --- click-free soft bypass ---
     // dry(input gain 適用前の素入力)を wet と同じ reportedLatency だけ遅延させて時間整合し、
-    // bypassMix で per-sample クロスフェードする。bypass 状態に関わらず常時 DSP を回すことで
-    // 復帰時の OS/IIR/limiter 状態不連続も防ぐ。
+    // bypassMix で per-sample クロスフェードする。soft bypass (bypass パラメータ) 中は DSP を
+    // 回し続けるので戻りも連続。hard bypass (processBlockBypassed) は wet を止め、復帰時に
+    // restartWetChain で作り直してから dry 保持 → 同じクロスフェードで戻す。
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> dryDelayLine;
     juce::SmoothedValue<float> bypassMix;   // 0 = active, 1 = bypassed (15ms ramp)
     juce::AudioBuffer<float> dryScratch;    // 遅延済み dry の一時保持 (wet 処理後に混ぜる)
@@ -114,6 +115,9 @@ private:
     // visInScratch: input gain 適用直後の |入力| (OS 後の buffer は処理済み信号なので別に保持)。
     juce::AudioBuffer<float> gainScratch;
     juce::AudioBuffer<float> visInScratch;
+    // mixScratch: bypass の per-sample mix。ビジュアライザが「実際に出ている減衰量」を
+    // 描けるよう、クロスフェードより前に確定させて共有する。
+    juce::AudioBuffer<float> mixScratch;
     int visFrameLen = 480;                  // 10ms 相当 (prepareToPlay で算出)
     int visFrameCount = 0;
     std::array<float, 2> visFramePeak { { 0.0f, 0.0f } };
@@ -122,6 +126,19 @@ private:
     // processBlock 1回分の実処理。numSamples <= preparedBlockSize が前提
     // (processBlock 側で分割保証済み)。
     void processChunk (juce::AudioBuffer<float>&);
+
+    /** Mode / Threshold / Knee を chain・limiter へ反映する。
+        processChunk の冒頭と restartWetChain から呼ぶ。 */
+    void applyChainParams() noexcept;
+
+    /** hard bypass から戻ったときに wet 経路を作り直す (設定 → reset → 設定)。
+        bypass 中は wet を回さないので、残っていた古い音はここで捨てる。 */
+    void restartWetChain() noexcept;
+
+    // hard bypass を通ったので、次の processBlock で wet を作り直す。prepareToPlay で消す
+    bool wetNeedsRestart = false;
+    // 作り直した wet が満ちるまで dry を出し続ける残りサンプル数 (サンプル単位で減らす)
+    int wetRestartHold = 0;
 
     // prepareToPlay で告知された最大ブロック長。dryScratch/oversampler の確保量はこれ前提
     // なので、超過ブロックを渡す契約違反ホストでは processBlock がこのサイズに分割処理する。

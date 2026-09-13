@@ -6,7 +6,7 @@ set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "build universal binary 
 
 # LANGUAGES に C を含める: AAX SDK ラッパーが C ソースを含むため、AAX 自動検出時に
 # C 言語が未有効だと generate 段で CMAKE_C_COMPILE_OBJECT エラーになる (CMake 4.x)
-project(KyoheiClipper VERSION 1.0.10 LANGUAGES C CXX)
+project(KyoheiClipper VERSION 1.0.11 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,7 +21,29 @@ add_compile_options(
     -fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.
 )
 
-add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../_sdk/JUCE JUCE)
+# JUCE の場所。-DJUCE_PATH=/path/to/JUCE で上書きできる。
+# 既定はこのマシンの配置 (~/Developer/_sdk/JUCE)。無ければ README どおりの兄弟ディレクトリ
+# (../JUCE) を見る。どちらも無ければ設定時に分かるようエラーにする。
+if(NOT DEFINED JUCE_PATH AND DEFINED ENV{JUCE_PATH})
+    set(JUCE_PATH "$ENV{JUCE_PATH}")
+endif()
+if(NOT DEFINED JUCE_PATH)
+    foreach(_juce_candidate
+            "${CMAKE_CURRENT_LIST_DIR}/../../../_sdk/JUCE"
+            "${CMAKE_CURRENT_LIST_DIR}/../JUCE")
+        if(EXISTS "${_juce_candidate}/CMakeLists.txt")
+            set(JUCE_PATH "${_juce_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT JUCE_PATH OR NOT EXISTS "${JUCE_PATH}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "JUCE not found. Put it at ../JUCE (sibling of this directory) "
+        "or pass -DJUCE_PATH=/path/to/JUCE.")
+endif()
+message(STATUS "JUCE: ${JUCE_PATH}")
+add_subdirectory(${JUCE_PATH} JUCE)
 
 # ============================================================
 # AAX SDK 自動検出 (任意)
@@ -60,7 +82,7 @@ if(AAX_SDK_PATH AND IS_DIRECTORY "${AAX_SDK_PATH}")
     juce_set_aax_sdk_path("${AAX_SDK_PATH}")
     list(APPEND KYOHEI_FORMATS AAX)
 else()
-    message(STATUS "AAX SDK not found (set -DAAX_SDK_PATH=... or env AAX_SDK_PATH to enable). Building VST3/AU/Standalone only.")
+    message(STATUS "AAX SDK not found (set -DAAX_SDK_PATH=... or env AAX_SDK_PATH to enable). Building VST3/AU only.")
 endif()
 
 # 共通の source 群

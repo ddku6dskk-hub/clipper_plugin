@@ -23,7 +23,7 @@ Both share a C2-Hermite soft-clip shaper and three Modes:
 ### UI
 
 Four sliders (Threshold / Knee / Input / Output), a Mode selector,
-and a GR meter (0–12 dB, 30 Hz refresh, peak hold 1 s).
+and a GR meter (0–9 dB, 30 Hz refresh, peak hold 1 s).
 
 The meter shows latency-aligned input/output peaks plus an HA-style **CLIP**
 indicator that lights when the output exceeds 0 dBFS. The input readout turns
@@ -34,14 +34,18 @@ red when the input reaches 0 dBFS.
 The left panel scrolls roughly the last 10 seconds in two independent lanes
 (L/R; a single lane on mono tracks), at a 10 ms frame resolution:
 
-- **cyan** – output level
+- **cyan** – level after gain reduction
 - **amber** – how much the limiter/shaper took off, drawn as a cap on top
 - **yellow line** – the current Threshold
 
-Levels are taken *after* the Input gain, so the peaks line up with the
-Threshold line directly. Per-frame gain reduction is measured inside the
+The analyser is **input-referred**: levels are taken *after* the Input gain and
+*before* the Output gain, so the peaks line up with the Threshold line directly.
+Moving Output therefore does not move the display — it is a picture of what the
+clipper is doing to the signal, not of the plugin's final output level (use the
+Out readout for that). Per-frame gain reduction is measured inside the
 oversampled domain from the gain coefficients actually applied — the same
-source as the GR meter, just at a finer time resolution.
+source as the GR meter, just at a finer time resolution, and it fades out with
+the Bypass crossfade exactly like the GR meter does.
 
 Below it, an info line shows the session maxima: `Peak: x dBFS | Max GR: y dB`
 (both measured, not predicted). **Clicking the info line resets those two
@@ -49,6 +53,23 @@ readouts** without clearing the scrolling history, so you can re-measure a
 section while still watching the graph.
 
 ---
+
+### Bypass
+
+Two independent paths, both latency-aligned. Toggling the Bypass parameter and
+returning from host bypass are crossfaded; entering host bypass switches to the
+dry signal immediately, without a crossfade.
+
+- **Bypass parameter** (soft) — crossfades between the processed signal and the
+  delayed dry over 15 ms. The processing keeps running underneath, so switching
+  back is seamless. The GR meter and the analyser both fade out with it.
+- **Host bypass** (hard) — the wet path stops entirely, so a bypassed instance
+  costs almost nothing (measured at 48 kHz / 512-sample blocks: 8.0 % of
+  real-time active vs **0.09 %** bypassed). Because the chain is stopped, it is
+  rebuilt on the way back: the dry signal is held for the reported latency and
+  then crossfaded into the wet over 15 ms. Leaving host bypass therefore takes
+  about 17 ms to reach full processing — a deliberate trade for not paying the
+  CPU while bypassed, and for never replaying audio left in the chain.
 
 ## Installation (macOS, AAX)
 
@@ -85,7 +106,8 @@ Requires:
 
 - CMake 3.22+
 - Xcode 15+ (macOS)
-- [JUCE](https://github.com/juce-framework/JUCE) as a sibling directory (`../JUCE`)
+- [JUCE](https://github.com/juce-framework/JUCE) as a sibling directory (`../JUCE`),
+  or anywhere else via `-DJUCE_PATH=/path/to/JUCE`
 - (Optional) AAX SDK 2.9.0+ for AAX target — see `CMakeLists.txt` for auto-detection paths
 
 ```sh
