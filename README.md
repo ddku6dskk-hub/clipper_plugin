@@ -25,9 +25,10 @@ Both share a C2-Hermite soft-clip shaper and three Modes:
 Four sliders (Threshold / Knee / Input / Output), a Mode selector,
 and a GR meter (0–9 dB, 30 Hz refresh, peak hold 1 s).
 
-The meter shows latency-aligned input/output peaks plus an HA-style **CLIP**
-indicator that lights when the output exceeds 0 dBFS. The input readout turns
-red when the input reaches 0 dBFS.
+Below the meter, a readout shows the input peak (dBFS, after the Input gain)
+and the gain-reduction peak (dB). An HA-style **CLIP** indicator lights when
+the output (a true-peak estimate, after the Output gain) exceeds 0 dBFS. The
+input readout turns red when the input reaches 0 dBFS.
 
 #### Analyser (scrolling visualiser)
 
@@ -41,11 +42,12 @@ The left panel scrolls roughly the last 10 seconds in two independent lanes
 The analyser is **input-referred**: levels are taken *after* the Input gain and
 *before* the Output gain, so the peaks line up with the Threshold line directly.
 Moving Output therefore does not move the display — it is a picture of what the
-clipper is doing to the signal, not of the plugin's final output level (use the
-Out readout for that). Per-frame gain reduction is measured inside the
-oversampled domain from the gain coefficients actually applied — the same
-source as the GR meter, just at a finer time resolution, and it fades out with
-the Bypass crossfade exactly like the GR meter does.
+clipper is doing to the signal, not of the plugin's final output level (watch
+the host's meter for that; the CLIP indicator lights if it exceeds 0 dBFS).
+Per-frame gain reduction is measured inside the oversampled domain from the
+gain coefficients actually applied — the same source as the GR meter, just at
+a finer time resolution, and it fades out with the Bypass crossfade exactly
+like the GR meter does.
 
 Below it, an info line shows the session maxima: `Peak: x dBFS | Max GR: y dB`
 (both measured, not predicted). **Clicking the info line resets those two
@@ -56,20 +58,21 @@ section while still watching the graph.
 
 ### Bypass
 
-Two independent paths, both latency-aligned. Toggling the Bypass parameter and
-returning from host bypass are crossfaded; entering host bypass switches to the
-dry signal immediately, without a crossfade.
+The host's bypass button drives the plug-in's own **Bypass** parameter — the
+AAX, AU and VST3 wrappers all hand it over (in Pro Tools it is the plug-in's
+Master Bypass). Engaging and releasing bypass both crossfade over 15 ms between
+the processed signal and the dry signal, delayed by the same latency, so
+nothing jumps in time. The processing keeps running underneath, so switching
+back is seamless; the GR meter and the analyser fade out with it.
 
-- **Bypass parameter** (soft) — crossfades between the processed signal and the
-  delayed dry over 15 ms. The processing keeps running underneath, so switching
-  back is seamless. The GR meter and the analyser both fade out with it.
-- **Host bypass** (hard) — the wet path stops entirely, so a bypassed instance
-  costs almost nothing (measured at 48 kHz / 512-sample blocks: 8.0 % of
-  real-time active vs **0.09 %** bypassed). Because the chain is stopped, it is
-  rebuilt on the way back: the dry signal is held for the reported latency and
-  then crossfaded into the wet over 15 ms. Leaving host bypass therefore takes
-  about 17 ms to reach full processing — a deliberate trade for not paying the
-  CPU while bypassed, and for never replaying audio left in the chain.
+Because the processing keeps running, bypass does **not** reduce the CPU load —
+a bypassed instance costs about as much as an active one. To free the CPU in
+Pro Tools, make the plug-in inactive instead.
+
+A separate hard-bypass path exists only as a fallback for hosts that call the
+plug-in's bypassed-processing callback directly; none of the shipped formats
+do. It stops the chain and rebuilds it on the way back: the dry signal is held
+for the reported latency, then crossfaded into the processed signal over 15 ms.
 
 ## Installation (macOS, AAX)
 

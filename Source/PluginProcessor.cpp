@@ -121,8 +121,20 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     }
 
 #if KYOHEI_SLAMMER
-    // Slammer: lookahead 段は使わない → OS 群遅延のみ
-    const int reportedLatency = juce::roundToInt (oversampler->getLatencyInSamples());
+    // Slammer: lookahead 段は使わない → レイテンシは OS 群遅延のみ。
+    // ただし 4x の OS 群遅延は base で 59.5 サンプル (JUCE の equiripple / max quality の実値) で
+    // 整数にならない。〜v1.0.11 はこれを roundToInt で 60 と報告していたので、出音は報告より
+    // 0.5 サンプル早く、host の PDC とも soft bypass の dry ともずれていた (実測 44.1〜192k 全部で
+    // 0.5000。並列で原音と 50:50 に混ぜると 48k の 20kHz で −2 dB の櫛形)。
+    // Clipper の look-ahead 切り上げと同じ考え方で、OS ドメインに 0〜(倍率−1) サンプルの純遅延
+    // (osPad) を足して合計を base の整数サンプルに揃える (4x なら 2 OS サンプル → 60.0)。
+    const double osFactorLin = std::pow (2.0, osFactor);
+    const double osLatencyOS = (double) oversampler->getLatencyInSamples() * osFactorLin;
+    const double fracOS = std::fmod (osLatencyOS, osFactorLin);
+    osPadLen = (fracOS > 1e-6 && osFactorLin - fracOS > 1e-6)
+                   ? juce::jmin (kMaxOsPad, (int) std::llround (osFactorLin - fracOS))
+                   : 0;
+    const int reportedLatency = juce::roundToInt ((osLatencyOS + (double) osPadLen) / osFactorLin);
     setLatencySamples (reportedLatency);
 #else
     // look-ahead limiter: 0.2 ms 相当（OS レート基準）
@@ -198,8 +210,11 @@ void KyoheiClipperProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     // 上で wet 経路も bypassMix も作り直したので、hard bypass からの復帰待ちも捨てる。
     // 残すと prepare 後の再生が「dry 保持 → フェード」から始まり、新規インスタンスと食い違う。
+    // prepare 自体が全部作り直すので、保留中のホストリセットも不要になる。
     wetNeedsRestart = false;
     wetRestartHold  = 0;
+    hostResetPending.store (false, std::memory_order_relaxed);
+    clearOsPad();
 
     grPeakDb.store    (0.0f,    std::memory_order_relaxed);
     inputPeakDb.store (-100.0f, std::memory_order_relaxed);
@@ -224,10 +239,21 @@ void KyoheiClipperProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (oversampler == nullptr || preparedBlockSize <= 0)
         return;
 
+    // 長さ 0 の呼び出しは何もしない。JUCE の VST3 ラッパーは入出力バス付きの 0 サンプル process
+    // (パラメータを反映させるためだけの呼び出し) をそのまま渡してくる。processChunk へ進むと
+    // Input/Output のゲインランプを 0 サンプルで使い切り、次のブロックが旧ゲインから新ゲインへ
+    // 段差で跳んでいた (〜v1.0.11。実測 段差 0.097、通常のランプは 0.0004)。
+    const int totalSamples = buffer.getNumSamples();
+    if (totalSamples <= 0)
+        return;
+
+    // ホストの reset() は印だけ立ててあるので、音を作る前にここで反映する
+    if (hostResetPending.exchange (false, std::memory_order_acquire))
+        applyHostReset();
+
     // dryScratch/oversampler の確保量は prepareToPlay の samplesPerBlock 前提。
     // 超過ブロックを渡す契約違反ホストでもオーバーランしないよう、確保済みサイズ以下に
     // 分割して処理する (alloc なし: chunk は元バッファ参照のビュー)。通常ホストは1チャンク。
-    const int totalSamples = buffer.getNumSamples();
     const int numChannels  = buffer.getNumChannels();
     const int maxChunk     = preparedBlockSize;
 
@@ -392,10 +418,11 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
         };
 
 #if KYOHEI_SLAMMER
-        // Slammer: ドラム用途向けに shaper のみ（lookahead なし）でトランジェント保持
+        // Slammer: ドラム用途向けに shaper のみ（lookahead なし）でトランジェント保持。
+        // osPad はレイテンシを整数サンプルに揃えるための純遅延 (prepareToPlay 参照)
         for (int i = 0; i < osNumSamples; ++i)
         {
-            data[i] = chain.process (data[i]);
+            data[i] = chain.process (osPad (chIdx, data[i]));
             accumulate (chain.getLastShaperGain());
             osPeak = juce::jmax (osPeak, std::abs (data[i]));
         }
@@ -552,6 +579,10 @@ void KyoheiClipperProcessor::processChunk (juce::AudioBuffer<float>& buffer)
 // **bypass が active の 0.89 倍のCPUを食い続ける** (実測: active 7.80% / bypass 6.97% /
 // 回さない場合 0.09%。1インスタンス・48kHz・512サンプル)。「重いプラグインを bypass して
 // CPU を浮かせる」運用が成立しなくなるので、回すのをやめて復帰時に作り直す。
+// ※ ただし JUCE の AAX/AU/VST3 ラッパーは getBypassParameter() を返している限り
+//   processBlockBypassed を呼ばない (AAX は bypass パラメータを PT の Master Bypass に割り当てる)。
+//   PT などのホスト bypass は soft bypass になり、CPU は浮かない。hard bypass はラッパーを
+//   通らずに直接呼ばれたときの保険。同じ作り直しをホストの reset() (applyHostReset) でも使う。
 //
 // 【設定は reset の前と後の両方で入れる】limiter と chain で reset の性質が逆だから。
 //  - LookaheadLimiter::reset() は threshInit を残し、threshold を targetThreshold へ
@@ -573,8 +604,40 @@ void KyoheiClipperProcessor::restartWetChain() noexcept
     for (auto& lim : limiters)
         lim.reset();
 #endif
+    clearOsPad();
 
     applyChainParams();
+}
+
+void KyoheiClipperProcessor::reset()
+{
+    hostResetPending.store (true, std::memory_order_release);
+}
+
+// reset() の実体 (audio thread、processBlock / processBlockBypassed の先頭)。
+// 新しく prepareToPlay したインスタンスと同じ音が出る状態へ戻す (T11 でビット一致を確認)。
+// wet は restartWetChain で作り直し、dry の遅延線も空にする。
+// hard bypass からの復帰と違って dry 保持もクロスフェードもしない: ホストがリセットを掛けるのは
+// 停止・ロケート・書き出し開始など「前の音を引きずってほしくない」場面なので、新規インスタンスと
+// 同じくレイテンシ分の無音から始めるのが正しい (dry を挟むと、書き出しの頭にクリップ前の音が混ざる)。
+// 〜v1.0.11 は reset() を実装しておらず、直前の音 (Clipper 76 / Slammer 60 サンプル) と
+// Clipper のリミッター減衰 (−5.5 dB @1ms → −0.6 dB @100ms) が残っていた。
+void KyoheiClipperProcessor::applyHostReset() noexcept
+{
+    restartWetChain();
+    dryDelayLine.reset();
+
+    bypassMix.setCurrentAndTargetValue (pBypass != nullptr && pBypass->load() > 0.5f ? 1.0f : 0.0f);
+    wetNeedsRestart = false;
+    wetRestartHold  = 0;
+
+    lastInGain  = juce::Decibels::decibelsToGain (pInputGain  != nullptr ? pInputGain->load()  : 0.0f);
+    lastOutGain = juce::Decibels::decibelsToGain (pOutputGain != nullptr ? pOutputGain->load() : 0.0f);
+
+    // 書きかけのビジュアライザフレームは捨てる (完成済みの履歴は残す。processBlockBypassed と同じ扱い)
+    visFrameCount = 0;
+    visFramePeak.fill (0.0f);
+    visFrameMinGain.fill (1.0f);
 }
 
 void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
@@ -594,6 +657,10 @@ void KyoheiClipperProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     const int totalSamples = buffer.getNumSamples();
     if (numChannels <= 0 || totalSamples <= 0)
         return;
+
+    // ホストの reset() はここでも反映する (dry の遅延線を空にし、wet は下の wetNeedsRestart で作り直す)
+    if (hostResetPending.exchange (false, std::memory_order_acquire))
+        applyHostReset();
 
     float peakIn = 0.0f;
 

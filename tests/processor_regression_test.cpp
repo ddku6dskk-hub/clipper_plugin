@@ -23,6 +23,18 @@
 //   R5  書きかけのビジュアライザフレームが hard bypass をまたいで古い GR を出す  → T9
 //   R6  T3 は全 dry 区間しか見ておらず wet の残留を検出できなかった              → T3
 //
+// 2026-09-24 の検品で、T1-T9 は出音を「新規インスタンスとの一致」でしか見ておらず、実装と独立な
+// 物差しを持っていないと分かった (シェイパー/リミッターを音から外す・Output ゲインを消す、の
+// 3 変異が全部素通り)。その物差しを T10 に置き、ホスト由来の呼び出し 2 種の穴を T11/T12 で塞いだ:
+//
+//   F2  Slammer の OS 群遅延 59.5 を 60 と報告し、出音が 0.5 サンプル早い         → T10 (I1)
+//   F3  長さ 0 の processBlock が Input/Output のゲインランプを使い切る            → T12
+//   F4  reset() 未実装で、ホストのリセット後も前の音とリミッター減衰が残る        → T11
+//
+// なお T3/T5-T9 が見ている processBlockBypassed は、JUCE の AAX/AU/VST3 ラッパーでは
+// getBypassParameter() を返している限り呼ばれない (ホストの bypass は bypass パラメータ =
+// soft bypass になる。AAX.cpp の process 参照)。ラッパーを通らずに呼ばれたときの保険の検証。
+//
 // ビルド/実行は tests/run_tests.sh を使う (SharedCode 静的ライブラリが必要なので、
 // 先に一度 CMake で Release ビルドしておくこと)。
 #include "PluginProcessor.h"
@@ -687,6 +699,266 @@ static void testAnalyserFrameDoesNotSpanHardBypass()
            "frames after a silent resume carry no pre-bypass GR or level");
 }
 
+// ---------------- 2026-09-24 検品: active 経路の出音 ----------------
+// 実装と独立な物差し (正弦の位相と振幅、閾値との大小) だけで判定する。新規インスタンスとの
+// 比較と違い、両方に同じ欠陥が入っていても見逃さない。
+// 【NaN】std::max / jmax は NaN を黙って捨てるので、非有限サンプルは別枠で数えて合否に入れる。
+
+// 正弦 1 本 (48 kHz) を L/R に入れて N サンプル流し、ch0 の出力を返す。最後の端数ブロックも流す
+static std::vector<float> runTone (KyoheiClipperProcessor& p, double f, float amp, int N)
+{
+    const double w = juce::MathConstants<double>::twoPi * f / 48000.0;
+    std::vector<float> y ((size_t) N);
+    juce::MidiBuffer m;
+    for (int off = 0; off < N; off += 512)
+    {
+        const int len = juce::jmin (512, N - off);
+        juce::AudioBuffer<float> b (2, len);
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < len; ++i)
+                b.setSample (c, i, (float) (amp * std::sin (w * (off + i))));
+        p.processBlock (b, m);
+        for (int i = 0; i < len; ++i)
+            y[(size_t) (off + i)] = b.getSample (0, i);
+    }
+    return y;
+}
+
+// 定常区間 [N/4, N) の最大 |y|。非有限が混じっていたら finite を false にする
+static float steadyPeak (const std::vector<float>& y, bool& finite)
+{
+    float pk = 0.0f;
+    for (size_t n = y.size() / 4; n < y.size(); ++n)
+    {
+        if (! std::isfinite (y[n]))
+            finite = false;
+        else
+            pk = std::max (pk, std::abs (y[n]));
+    }
+    return pk;
+}
+
+// 閾値のはるか下 (threshold 0 dB) で正弦を流し、定常区間の振幅比と
+// 「位相から求めた遅延 − 報告レイテンシ」(サンプル) を返す。
+// 窓 18000 サンプルは 100 Hz〜10 kHz のどれでも半周期の整数倍なので、lock-in の漏れが乗らない。
+struct ToneResult { double gain, delayErr; bool finite; };
+static ToneResult measureTone (float inGainDb, float outGainDb, double f, float amp)
+{
+    KyoheiClipperProcessor p;
+    setParam (p, "threshold", 0.0f);
+    setParam (p, "knee", 0.0f);
+    setParam (p, "inputGain", inGainDb);
+    setParam (p, "outputGain", outGainDb);
+    p.prepareToPlay (48000.0, 512);
+    const int D = p.getLatencySamples();
+    const int N = 24000;
+    const auto y = runTone (p, f, amp, N);
+
+    const double w = juce::MathConstants<double>::twoPi * f / 48000.0;
+    double I = 0.0, Q = 0.0;
+    bool finite = true;
+    for (int n = N / 4; n < N; ++n)
+    {
+        if (! std::isfinite (y[(size_t) n]))
+            finite = false;
+        I += y[(size_t) n] * std::sin (w * n);
+        Q += y[(size_t) n] * std::cos (w * n);
+    }
+    const double A = 2.0 * std::sqrt (I * I + Q * Q) / (N - N / 4);
+    // y ≈ A·sin(w(n − τ)) なので位相は −wτ。報告レイテンシ D との差を [−π, π) に畳んでサンプルに直す
+    const double d = std::remainder (std::atan2 (Q, I) + w * D, juce::MathConstants<double>::twoPi);
+    const double delayErr = -d / w;
+    return { A / amp, delayErr, finite && std::isfinite (A) && A > 0.0 && std::isfinite (delayErr) };
+}
+
+static void testActivePathInvariants()
+{
+    printf ("T10: active-path audio against implementation-independent references\n");
+
+    // I1 閾値のはるか下では、出力 = 入力を報告レイテンシだけ遅らせたもの (遅延も振幅も)。
+    //    実遅延が報告とずれると、host の PDC とも soft bypass の dry とも合わなくなる (F2)
+    double worstDelay = 0.0, worstGain = 0.0;
+    bool finite = true;
+    for (double f : { 100.0, 1000.0, 5000.0, 10000.0 })
+    {
+        const auto t = measureTone (0.0f, 0.0f, f, 0.1f);
+        finite = finite && t.finite;
+        if (t.finite)
+        {
+            worstDelay = std::max (worstDelay, std::abs (t.delayErr));
+            worstGain  = std::max (worstGain,  std::abs (20.0 * std::log10 (t.gain)));
+        }
+    }
+    printf ("     I1: |measured delay - reported latency| max %.4f samples, |gain| max %.4f dB\n",
+            worstDelay, worstGain);
+    check (finite && worstDelay < 0.01, "I1 below threshold, the output is delayed by exactly the reported latency");
+    check (finite && worstGain < 0.1, "I1 below threshold, the level is unchanged");
+
+    // I2 天井: B.Wall / knee 0 で +12 dB 突っ込んでも threshold に張り付く。
+    //    Slammer は天井を保証しない設計 (ダウンサンプルのギブスで超える) なので、外れ検出用の幅にする
+#if KYOHEI_SLAMMER
+    constexpr float ceilingTolDb = 1.0f;
+#else
+    constexpr float ceilingTolDb = 0.2f;
+#endif
+    {
+        KyoheiClipperProcessor p;
+        setParam (p, "threshold", -6.0f);
+        setParam (p, "knee", 0.0f);
+        setParam (p, "inputGain", 12.0f);
+        p.prepareToPlay (48000.0, 512);
+        bool ok = true;
+        const float pkDb = juce::Decibels::gainToDecibels (steadyPeak (runTone (p, 110.0, 0.9f, 96000), ok), -200.0f);
+        printf ("     I2: output peak %+.3f dBFS at threshold -6.0 (+12 dB drive)\n", pkDb);
+        check (ok && pkDb <= -6.0f + ceilingTolDb, "I2 driven hard, the output stays at the threshold");
+    }
+
+    // I3/I4 Output / Input ゲインが出音に届く (線形域なので +6 dB がそのまま +6 dB)
+    {
+        const auto t0   = measureTone (0.0f, 0.0f, 1000.0, 0.05f);
+        const auto tOut = measureTone (0.0f, 6.0f, 1000.0, 0.05f);
+        const auto tIn  = measureTone (6.0f, 0.0f, 1000.0, 0.05f);
+        const bool ok = t0.finite && tOut.finite && tIn.finite;
+        const double outDb = 20.0 * std::log10 (tOut.gain / t0.gain);
+        const double inDb  = 20.0 * std::log10 (tIn.gain / t0.gain);
+        printf ("     I3/I4: Output +6 dB -> %+.3f dB, Input +6 dB -> %+.3f dB\n", outDb, inDb);
+        check (ok && std::abs (outDb - 6.0) < 0.05, "I3 the Output gain reaches the audio");
+        check (ok && std::abs (inDb - 6.0) < 0.05, "I4 the Input gain reaches the audio");
+    }
+
+    // I5 ニー域: 閾値の 0.3 dB 下 (リミッターは動かない) の正弦を knee 12 dB で通すと、
+    //    シェイパーだけが山を丸める。Clipper はリミッター単独でも天井を守るので、シェイパーが
+    //    音から外れた欠陥は I2 では見えない。ここで見る
+    {
+        KyoheiClipperProcessor p;
+        setParam (p, "threshold", -6.0f);
+        setParam (p, "knee", 12.0f);
+        p.prepareToPlay (48000.0, 512);
+        const float amp = juce::Decibels::decibelsToGain (-6.3f);
+        bool ok = true;
+        const float pk = steadyPeak (runTone (p, 440.0, amp, 48000), ok);
+        const float redDb = ok && pk > 0.0f ? 20.0f * std::log10 (amp / pk) : 0.0f;
+        printf ("     I5: knee 12 dB, tone 0.3 dB under the threshold -> peak reduced by %.3f dB\n", redDb);
+        check (ok && redDb > 0.3f, "I5 the shaper's knee reaches the audio");
+    }
+}
+
+// F4: ホストの reset() (AU の Reset / VST3 の setProcessing(false)。AAX は呼ばない) の直後は、
+// その時点の設定で新しく用意したインスタンスと**ビット一致**すること。v1.0.11 は reset() を
+// 実装しておらず、直前の音 (Clipper 76 / Slammer 60 サンプル) と Clipper のリミッター減衰
+// (−5.5 dB @1ms → −0.6 dB @100ms) が残っていた。bypass 中・bypass フェード途中の reset も見る。
+static void testHostResetMatchesFreshInstance()
+{
+    printf ("T11: after the host's reset() the output equals a freshly prepared instance\n");
+
+    const double fs = 48000.0;
+    const int len = 128;
+    const char* bypassNames[] = { "active", "bypassed", "mid-fade" };
+    float worst = 0.0f;
+    bool finite = true;
+    int cases = 0;
+    for (float mode : { 0.0f, 1.0f, 2.0f })
+    {
+        for (int bypassCase = 0; bypassCase < 3; ++bypassCase)
+        {
+            const auto setup = [mode] (KyoheiClipperProcessor& proc)
+            {
+                setParam (proc, "mode", mode);
+                setParam (proc, "threshold", -12.0f);
+                setParam (proc, "knee", 3.0f);
+                setParam (proc, "inputGain", 12.0f);
+            };
+            KyoheiClipperProcessor p;
+            setup (p);
+            if (bypassCase == 1)
+                setParam (p, "bypass", 1.0f);
+            p.prepareToPlay (fs, len);
+            Signal sig;
+            sig.amp = 0.8f;
+            runSegment (p, sig, 40 * len, { len }, false, nullptr, nullptr);   // 大音量で状態を濃くする
+            if (bypassCase == 2)
+            {
+                setParam (p, "bypass", 1.0f);
+                runSegment (p, sig, 2 * len, { len }, false, nullptr, nullptr); // 15ms フェードの途中
+            }
+            p.reset();
+
+            KyoheiClipperProcessor q;
+            setup (q);
+            if (bypassCase != 0)
+                setParam (q, "bypass", 1.0f);
+            q.prepareToPlay (fs, len);
+
+            Signal qs = sig;                        // 同じ位置から同じ入力
+            const int window = p.getLatencySamples() + fadeSamples (fs) + 4096;
+            std::vector<float> op, oq;
+            runSegment (p, sig, window, { len }, false, nullptr, &op);
+            runSegment (q, qs,  window, { len }, false, nullptr, &oq);
+            float w = 0.0f;
+            for (size_t n = 0; n < op.size(); ++n)
+            {
+                if (! std::isfinite (op[n]) || ! std::isfinite (oq[n]))
+                    finite = false;
+                else
+                    w = std::max (w, std::abs (op[n] - oq[n]));
+            }
+            if (w != 0.0f)
+                printf ("     mode %d / %s: max |after reset - fresh| %.3e\n",
+                        (int) mode, bypassNames[bypassCase], w);
+            worst = std::max (worst, w);
+            ++cases;
+        }
+    }
+    printf ("     worst |after reset() - fresh instance| = %.3e (%d cases)\n", worst, cases);
+    check (finite && worst == 0.0f, "reset() leaves nothing a fresh instance would not have (all modes, bypass states)");
+}
+
+// F3: 長さ 0 の processBlock が Input/Output のゲインランプを使い切っていた。変更直後に
+// 0 サンプル呼び出しが挟まると、次のブロックが旧ゲインから新ゲインへ段差で跳ぶ
+// (実測 段差 0.097 / 通常のランプ 0.0004)。JUCE の VST3 ラッパーは、入出力バス付きの
+// 0 サンプル process をそのまま processBlock に渡す。期待: 挟まないインスタンスとビット一致。
+static void testZeroLengthBlockIsANoOp()
+{
+    printf ("T12: a zero-length block changes nothing\n");
+
+    float worst = 0.0f;
+    bool finite = true;
+    for (float mode : { 0.0f, 2.0f })
+    {
+        KyoheiClipperProcessor p, q;
+        for (auto* proc : { &p, &q })
+        {
+            setParam (*proc, "mode", mode);
+            setParam (*proc, "threshold", -6.0f);
+            proc->prepareToPlay (48000.0, 256);
+        }
+        Signal sp, sq;
+        runSegment (p, sp, 20 * 256, { 256 }, false, nullptr, nullptr);
+        runSegment (q, sq, 20 * 256, { 256 }, false, nullptr, nullptr);
+        for (auto* proc : { &p, &q })
+        {
+            setParam (*proc, "inputGain", 6.0f);
+            setParam (*proc, "outputGain", -3.0f);
+        }
+        juce::AudioBuffer<float> empty (2, 0);
+        juce::MidiBuffer m;
+        p.processBlock (empty, m);                   // p にだけ 0 サンプル呼び出しを挟む
+
+        std::vector<float> op, oq;
+        runSegment (p, sp, 8 * 256, { 256 }, false, nullptr, &op);
+        runSegment (q, sq, 8 * 256, { 256 }, false, nullptr, &oq);
+        for (size_t n = 0; n < op.size(); ++n)
+        {
+            if (! std::isfinite (op[n]) || ! std::isfinite (oq[n]))
+                finite = false;
+            else
+                worst = std::max (worst, std::abs (op[n] - oq[n]));
+        }
+    }
+    printf ("     worst |with a zero-length block - without| = %.3e\n", worst);
+    check (finite && worst == 0.0f, "a zero-length block leaves the gain ramps (and everything else) untouched");
+}
+
 int main()
 {
     juce::ScopedJuceInitialiser_GUI init;
@@ -700,6 +972,9 @@ int main()
     testResumeHoldIsSampleAccurate();
     testPrepareClearsResumeState();
     testAnalyserFrameDoesNotSpanHardBypass();
+    testActivePathInvariants();
+    testHostResetMatchesFreshInstance();
+    testZeroLengthBlockIsANoOp();
     printf ("\n%s (%d failures)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
 }

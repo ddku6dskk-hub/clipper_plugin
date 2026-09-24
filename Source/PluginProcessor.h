@@ -14,6 +14,10 @@ public:
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
+    // ホストのリセット要求 (AU の Reset / VST3 の setProcessing(false)。AAX は呼ばない)。
+    // 呼ぶスレッドはホスト次第なので印を立てるだけにして、作り直しは次の processBlock の
+    // 先頭で行う (applyHostReset)。
+    void reset() override;
     bool isBusesLayoutSupported (const BusesLayout&) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
@@ -139,6 +143,38 @@ private:
     bool wetNeedsRestart = false;
     // 作り直した wet が満ちるまで dry を出し続ける残りサンプル数 (サンプル単位で減らす)
     int wetRestartHold = 0;
+
+    /** reset() の実体 (audio thread)。新しく prepareToPlay したインスタンスと同じ音が出る状態へ戻す。 */
+    void applyHostReset() noexcept;
+    // reset() が呼ばれた。次の processBlock / processBlockBypassed の先頭で applyHostReset する
+    std::atomic<bool> hostResetPending { false };
+
+    // --- OS ドメインの純遅延 (Slammer のレイテンシを base の整数サンプルに揃える。prepareToPlay 参照) ---
+    // Clipper は look-ahead の切り上げで揃えているので使わない (osPadLen == 0 のまま)。
+    static constexpr int kMaxOsPad = 16;
+    std::array<std::array<float, kMaxOsPad>, 2> osPadBuf {};
+    std::array<int, 2> osPadPos { { 0, 0 } };
+    int osPadLen = 0;
+
+    float osPad (size_t ch, float x) noexcept
+    {
+        if (osPadLen <= 0)
+            return x;
+        auto& buf = osPadBuf[ch];
+        auto& pos = osPadPos[ch];
+        const float y = buf[(size_t) pos];
+        buf[(size_t) pos] = x;
+        if (++pos >= osPadLen)
+            pos = 0;
+        return y;
+    }
+
+    void clearOsPad() noexcept
+    {
+        for (auto& b : osPadBuf)
+            b.fill (0.0f);
+        osPadPos = { { 0, 0 } };
+    }
 
     // prepareToPlay で告知された最大ブロック長。dryScratch/oversampler の確保量はこれ前提
     // なので、超過ブロックを渡す契約違反ホストでは processBlock がこのサイズに分割処理する。
